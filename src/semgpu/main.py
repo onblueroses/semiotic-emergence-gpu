@@ -51,9 +51,21 @@ TRAJ_COLUMNS = (
     + [f"contrast_{i}{j}" for i in range(6) for j in range(i + 1, 6)]  # 15 pairs
 )
 
-MAX_SIGNALS = 50_000
-MAX_EVENTS = 100_000
 FLUCT_WINDOW = 10
+
+
+def _buffer_sizes(pop_size: int) -> tuple[int, int]:
+    """Compute signal and event buffer sizes scaled to population.
+
+    At 384 prey the defaults are 50k/100k. At larger populations,
+    scale proportionally to avoid ring buffer overflow.
+    """
+    base_pop = 384
+    base_signals = 50_000
+    base_events = 100_000
+    scale = max(1, pop_size // base_pop)
+    return base_signals * scale, base_events * scale
+
 
 # input_mi.csv: 37 columns
 INPUT_MI_COLUMNS = ["generation"] + [
@@ -83,6 +95,7 @@ def run_seed(
     key = jax.random.key(seed)
 
     N = params.pop_size
+    max_signals, max_events = _buffer_sizes(N)
     k1, k2, k3, key = jax.random.split(key, 4)
 
     # Initialize population
@@ -127,6 +140,10 @@ def run_seed(
             f"patches={params.patch_ratio*100:.0f}% kin_bonus={params.kin_bonus:.2f} "
             f"sig_cost={params.signal_cost:.4f} sig_range={params.signal_range:.1f}"
         )
+        print(
+            f"Backend: {jax.default_backend()} | "
+            f"Buffers: signals={max_signals} events={max_events}"
+        )
 
         for gen in range(generations):
             gen_start = time.time()
@@ -145,9 +162,9 @@ def run_seed(
                 zone_radius=params.zone_radius,
                 zone_speed=params.zone_speed,
                 patch_ratio=params.patch_ratio,
-                max_signals=MAX_SIGNALS,
+                max_signals=max_signals,
                 ticks_per_eval=params.ticks_per_eval,
-                max_events=MAX_EVENTS,
+                max_events=max_events,
                 key=k_eval,
             )
 
@@ -162,11 +179,11 @@ def run_seed(
                 food_count=params.food_count,
                 signal_ticks=params.signal_ticks,
                 no_signals=params.no_signals,
-                max_signals=MAX_SIGNALS,
+                max_signals=max_signals,
                 ticks_per_eval=params.ticks_per_eval,
                 mi_bins=mi_bins,
                 zone_radius_scalar=params.zone_radius,
-                max_events=MAX_EVENTS,
+                max_events=max_events,
             )
 
             fitness = result.fitness
