@@ -1,0 +1,140 @@
+"""Integration tests - full generation evaluation."""
+
+import jax
+import jax.numpy as jnp
+
+from semgpu.brain import DEFAULT_BASE_HIDDEN, DEFAULT_SIGNAL_HIDDEN, MAX_GENOME_LEN
+from semgpu.world import init_world, evaluate_generation
+
+
+def test_evaluate_generation_runs():
+    """Run a full generation with small population."""
+    key = jax.random.key(42)
+    n = 20
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    ws = init_world(
+        prey_x=jax.random.randint(k1, (n,), 0, 20),
+        prey_y=jax.random.randint(k2, (n,), 0, 20),
+        weights=jax.random.normal(k3, (n, MAX_GENOME_LEN)) * 0.5,
+        base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+        signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+        num_zones=3,
+        food_count=30,
+        grid_size=20,
+        zone_radius=4.0,
+        zone_speed=0.5,
+        patch_ratio=0.5,
+        max_signals=500,
+        ticks_per_eval=50,
+        max_events=1000,
+        key=key,
+    )
+
+    result = evaluate_generation(
+        ws,
+        grid_size=20,
+        signal_range=8.0,
+        base_drain=0.0008,
+        signal_cost=0.002,
+        zone_drain_rate=0.02,
+        patch_ratio=0.5,
+        food_count=30,
+        signal_ticks=4,
+        no_signals=False,
+        max_signals=500,
+        ticks_per_eval=50,
+    )
+
+    assert result.fitness.shape == (n,)
+    assert jnp.all(result.fitness >= 0)
+    # After 50 ticks, some prey should have survived and eaten food
+    assert jnp.max(result.ticks_alive) > 0
+    assert result.final_state.tick == 50
+
+
+def test_evaluate_generation_fitness_formula():
+    """Verify fitness = ticks_alive * (1 + food_eaten * 0.1)."""
+    key = jax.random.key(7)
+    n = 10
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    ws = init_world(
+        prey_x=jax.random.randint(k1, (n,), 0, 20),
+        prey_y=jax.random.randint(k2, (n,), 0, 20),
+        weights=jax.random.normal(k3, (n, MAX_GENOME_LEN)) * 0.5,
+        base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+        signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+        num_zones=1,
+        food_count=50,
+        grid_size=20,
+        zone_radius=2.0,
+        zone_speed=0.0,
+        patch_ratio=0.0,
+        max_signals=200,
+        ticks_per_eval=100,
+        max_events=1000,
+        key=key,
+    )
+
+    result = evaluate_generation(
+        ws,
+        grid_size=20,
+        signal_range=8.0,
+        base_drain=0.0008,
+        signal_cost=0.002,
+        zone_drain_rate=0.02,
+        patch_ratio=0.0,
+        food_count=50,
+        signal_ticks=4,
+        no_signals=False,
+        max_signals=200,
+        ticks_per_eval=100,
+    )
+
+    expected = result.ticks_alive.astype(jnp.float32) * (
+        1.0 + result.food_eaten.astype(jnp.float32) * 0.1
+    )
+    assert jnp.allclose(result.fitness, expected)
+
+
+def test_no_signals_mode():
+    """Counterfactual mode: no signals emitted."""
+    key = jax.random.key(123)
+    n = 10
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    ws = init_world(
+        prey_x=jax.random.randint(k1, (n,), 0, 20),
+        prey_y=jax.random.randint(k2, (n,), 0, 20),
+        weights=jax.random.normal(k3, (n, MAX_GENOME_LEN)) * 0.5,
+        base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+        signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+        num_zones=1,
+        food_count=20,
+        grid_size=20,
+        zone_radius=3.0,
+        zone_speed=0.0,
+        patch_ratio=0.0,
+        max_signals=100,
+        ticks_per_eval=50,
+        max_events=1000,
+        key=key,
+    )
+
+    result = evaluate_generation(
+        ws,
+        grid_size=20,
+        signal_range=8.0,
+        base_drain=0.0008,
+        signal_cost=0.002,
+        zone_drain_rate=0.02,
+        patch_ratio=0.0,
+        food_count=20,
+        signal_ticks=4,
+        no_signals=True,
+        max_signals=100,
+        ticks_per_eval=50,
+    )
+
+    assert int(result.total_signals) == 0
