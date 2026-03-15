@@ -479,31 +479,22 @@ def step(
     emit_cost = jnp.where(can_emit, signal_cost, 0.0)
     state = state._replace(energy=state.energy - emit_cost)
 
-    # Write signals to ring buffer
-    num_emitters = jnp.sum(can_emit)
-    emit_indices = jnp.where(can_emit, jnp.arange(N), -1)
+    # Write signals to ring buffer - parallel scatter via cumsum
+    emit_count = jnp.sum(can_emit.astype(jnp.int32))
+    sig_local_idx = jnp.cumsum(can_emit.astype(jnp.int32)) - 1
+    sig_write_pos = (state.sig_cursor + sig_local_idx) % max_signals
 
-    # For each emitting prey, write to the ring buffer at cursor position
-    # Scan over emitters to sequentially write (needed for cursor management)
-    def write_signal(carry, prey_idx):
-        sig_x, sig_y, sig_sym, sig_tick_arr, sig_valid_arr, cursor, count = carry
-        is_emitter = prey_idx >= 0
-        write_pos = cursor % max_signals
-        sig_x = jnp.where(is_emitter, sig_x.at[write_pos].set(state.prey_x[jnp.clip(prey_idx, 0)]), sig_x)
-        sig_y = jnp.where(is_emitter, sig_y.at[write_pos].set(state.prey_y[jnp.clip(prey_idx, 0)]), sig_y)
-        sig_sym = jnp.where(is_emitter, sig_sym.at[write_pos].set(symbol_indices[jnp.clip(prey_idx, 0)]), sig_sym)
-        sig_tick_arr = jnp.where(is_emitter, sig_tick_arr.at[write_pos].set(tick), sig_tick_arr)
-        sig_valid_arr = jnp.where(is_emitter, sig_valid_arr.at[write_pos].set(True), sig_valid_arr)
-        cursor = jnp.where(is_emitter, cursor + 1, cursor)
-        count = jnp.where(is_emitter, count + 1, count)
-        return (sig_x, sig_y, sig_sym, sig_tick_arr, sig_valid_arr, cursor, count), None
-
-    init_carry = (
-        state.sig_x, state.sig_y, state.sig_symbol, state.sig_tick,
-        state.sig_valid, state.sig_cursor, jnp.int32(0)
-    )
-    (new_sig_x, new_sig_y, new_sig_sym, new_sig_tick, new_sig_valid, new_cursor, emit_count), _ = \
-        jax.lax.scan(write_signal, init_carry, emit_indices)
+    new_sig_x = state.sig_x.at[sig_write_pos].set(
+        jnp.where(can_emit, state.prey_x, state.sig_x[sig_write_pos]))
+    new_sig_y = state.sig_y.at[sig_write_pos].set(
+        jnp.where(can_emit, state.prey_y, state.sig_y[sig_write_pos]))
+    new_sig_sym = state.sig_symbol.at[sig_write_pos].set(
+        jnp.where(can_emit, symbol_indices, state.sig_symbol[sig_write_pos]))
+    new_sig_tick = state.sig_tick.at[sig_write_pos].set(
+        jnp.where(can_emit, tick, state.sig_tick[sig_write_pos]))
+    new_sig_valid = state.sig_valid.at[sig_write_pos].set(
+        jnp.where(can_emit, True, state.sig_valid[sig_write_pos]))
+    new_cursor = state.sig_cursor + emit_count
 
     state = state._replace(
         sig_x=new_sig_x, sig_y=new_sig_y, sig_symbol=new_sig_sym,
