@@ -157,17 +157,11 @@ def build_cell_grid(
     cells = jnp.full((num_cells, max_per_cell), -1, dtype=jnp.int32)
 
     # Scatter sorted agents into grid
-    # For each sorted alive agent, compute its slot in its cell
     is_valid = sorted_cells < num_cells  # alive entities
-    # Compute position within cell
-    same_as_prev = jnp.concatenate([jnp.array([False]), sorted_cells[1:] == sorted_cells[:-1]])
-    within_cell_pos = jnp.zeros(N, dtype=jnp.int32)
-
-    def scan_fn(carry, same):
-        pos = jnp.where(same, carry + 1, 0)
-        return pos, pos
-
-    _, within_cell_pos = jax.lax.scan(scan_fn, jnp.int32(0), same_as_prev)
+    # Within-cell position: index in sorted order minus where that cell starts
+    # Clamp sorted_cells to valid range for indexing cell_starts
+    safe_cells = jnp.clip(sorted_cells, 0, num_cells)
+    within_cell_pos = jnp.arange(N) - cell_starts[safe_cells]
 
     # Only scatter if position < max_per_cell and entity is valid
     valid_scatter = is_valid & (within_cell_pos < max_per_cell)
@@ -230,13 +224,11 @@ def build_coarse_grid(
     cells = jnp.full((num_cells, max_per_cell), -1, dtype=jnp.int32)
 
     is_valid_sorted = sorted_cells < num_cells
-    same_as_prev = jnp.concatenate([jnp.array([False]), sorted_cells[1:] == sorted_cells[:-1]])
-
-    def scan_fn(carry, same):
-        pos = jnp.where(same, carry + 1, 0)
-        return pos, pos
-
-    _, within_cell_pos = jax.lax.scan(scan_fn, jnp.int32(0), same_as_prev)
+    # Within-cell position: parallel via cell_starts lookup
+    cell_starts = jnp.zeros(num_cells + 1, dtype=jnp.int32)
+    cell_starts = cell_starts.at[1:].set(jnp.cumsum(counts))
+    safe_cells = jnp.clip(sorted_cells, 0, num_cells)
+    within_cell_pos = jnp.arange(N) - cell_starts[safe_cells]
 
     valid_scatter = is_valid_sorted & (within_cell_pos < max_per_cell)
     flat_idx = sorted_cells * max_per_cell + within_cell_pos
