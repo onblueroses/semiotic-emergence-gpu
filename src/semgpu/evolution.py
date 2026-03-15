@@ -348,13 +348,9 @@ def compute_kin_bonus(
     pa = parent_indices       # (N, 2)
     ga = grandparent_indices  # (N, 4)
 
-    # Use max possible index + 1 as array size to handle any parent index range.
-    # Parent indices come from evolution (0..N-1) but tests may use arbitrary values.
-    all_indices = jnp.concatenate([pa.reshape(-1), ga.reshape(-1)])
-    max_idx = jnp.maximum(jnp.max(all_indices) + 1, N)
-
+    # Parent/grandparent indices are in [0, N-1] or -1. Size arrays to N.
     # Sibling bonus: aggregate fitness by shared parent index
-    parent_fitness_sum = jnp.zeros(max_idx, dtype=jnp.float32)
+    parent_fitness_sum = jnp.zeros(N, dtype=jnp.float32)
     for k in range(2):
         valid = pa[:, k] >= 0
         idx = jnp.clip(pa[:, k], 0)
@@ -370,7 +366,7 @@ def compute_kin_bonus(
         sib_sum = sib_sum + jnp.where(valid, parent_fitness_sum[idx] - fitness, 0.0)
 
     # Cousin bonus: aggregate fitness by shared grandparent index
-    gp_fitness_sum = jnp.zeros(max_idx, dtype=jnp.float32)
+    gp_fitness_sum = jnp.zeros(N, dtype=jnp.float32)
     for k in range(4):
         valid = ga[:, k] >= 0
         idx = jnp.clip(ga[:, k], 0)

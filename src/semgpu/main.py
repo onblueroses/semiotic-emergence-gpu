@@ -54,17 +54,17 @@ TRAJ_COLUMNS = (
 FLUCT_WINDOW = 10
 
 
-def _buffer_sizes(pop_size: int) -> tuple[int, int]:
-    """Compute signal and event buffer sizes scaled to population.
+def _buffer_sizes(pop_size: int, ticks: int = 500) -> tuple[int, int]:
+    """Compute signal and event buffer sizes based on actual capacity needs.
 
-    At 384 prey the defaults are 50k/100k. At larger populations,
-    scale proportionally to avoid ring buffer overflow.
+    Signal ring buffer: holds active signals (max lifetime = signal_ticks=4).
+    Worst case = pop * 4 if every prey emits every tick. Use pop * 6 for headroom.
+    Event ring buffer: for input MI statistics. Needs enough samples for
+    statistical validity, not every emission. pop * 20 is generous.
     """
-    base_pop = 384
-    base_signals = 50_000
-    base_events = 100_000
-    scale = max(1, pop_size // base_pop)
-    return base_signals * scale, base_events * scale
+    max_signals = max(50_000, pop_size * 6)
+    max_events = max(100_000, pop_size * 20)
+    return max_signals, max_events
 
 
 # input_mi.csv: 37 columns

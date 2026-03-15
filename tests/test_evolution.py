@@ -135,9 +135,9 @@ def test_elites_unchanged():
 def test_kin_bonus():
     N = 6
     fitness = jnp.ones(N)
-    # Agents 0 and 1 share parent 10 -> siblings
+    # Agents 0 and 1 share parent 4 -> siblings
     parents = jnp.array([
-        [10, 11], [10, 12], [-1, -1], [-1, -1], [-1, -1], [-1, -1]
+        [4, 5], [4, 3], [-1, -1], [-1, -1], [-1, -1], [-1, -1]
     ], dtype=jnp.int32)
     grandparents = jnp.full((N, 4), -1, dtype=jnp.int32)
 
