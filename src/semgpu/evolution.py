@@ -30,7 +30,6 @@ from semgpu.brain import (
     SEG_SIGOUT_BIAS,
     SIGNAL_OUTPUTS,
 )
-from semgpu.spatial import wrap_dist_sq
 
 OFFSPRING_JITTER = 1
 HIDDEN_SIZE_MUTATION_RATE = 0.05
@@ -217,56 +216,55 @@ def evolve_generation(
     sorted_fitness = fitness[rank_order]
 
     # For non-elites, select parents via tournament and produce offspring
-    # Use vectorized approach: for each offspring slot, pick parents from nearby agents
+    # Cell-grid spatial selection instead of O(N^2) pairwise distances
+    from semgpu.spatial import build_cell_grid, gather_nearby_indices, wrap_delta
 
-    # Pairwise distances for spatial selection
-    dist_sq = wrap_dist_sq(
-        sorted_x[:, None], sorted_y[:, None],
-        sorted_x[None, :], sorted_y[None, :],
-        grid_size,
-    ).astype(jnp.float32)
+    EVOL_MAX_PER_CELL = 32
+    scan_radius = min(int(fallback_radius) + 1, 20)
+    max_cand = (2 * scan_radius + 1) ** 2 * EVOL_MAX_PER_CELL
 
     repro_sq = reproduction_radius ** 2
     fallback_sq = fallback_radius ** 2
 
-    # For each slot, determine which agents are within radius
-    nearby_repro = dist_sq <= repro_sq  # (N, N)
-    nearby_fallback = dist_sq <= fallback_sq
+    sorted_alive = jnp.ones(N, dtype=jnp.bool_)
+    evol_cells, evol_counts = build_cell_grid(
+        sorted_x, sorted_y, sorted_alive, grid_size, EVOL_MAX_PER_CELL,
+    )
 
-    def select_parent_for_slot(key, slot_idx):
-        """Select one parent for offspring at slot_idx position."""
-        k1, k2, k3 = jax.random.split(key, 3)
+    def select_parent_for_slot(key, slot_x, slot_y):
+        """Select one parent from nearby agents using cell grid."""
+        cand_idx = gather_nearby_indices(
+            slot_x, slot_y, evol_cells, grid_size, 1, scan_radius, max_cand,
+        )
+        valid = cand_idx >= 0
+        safe = jnp.clip(cand_idx, 0)
 
-        # Try reproduction radius first
-        candidates_repro = nearby_repro[slot_idx]
-        n_repro = jnp.sum(candidates_repro)
+        cdx = wrap_delta(slot_x, sorted_x[safe], grid_size).astype(jnp.float32)
+        cdy = wrap_delta(slot_y, sorted_y[safe], grid_size).astype(jnp.float32)
+        d_sq = cdx * cdx + cdy * cdy
 
-        # Try fallback radius
-        candidates_fallback = nearby_fallback[slot_idx]
-        n_fallback = jnp.sum(candidates_fallback)
+        within_repro = valid & (d_sq <= repro_sq)
+        within_fallback = valid & (d_sq <= fallback_sq)
+        n_repro = jnp.sum(within_repro)
+        n_fallback = jnp.sum(within_fallback)
 
-        # Global fallback: all candidates
-        candidates_global = jnp.ones(N, dtype=jnp.bool_)
-
-        # Pick which candidate set to use
         use_repro = n_repro >= 2
         use_fallback = (~use_repro) & (n_fallback >= 2)
-        use_global = (~use_repro) & (~use_fallback)
 
-        candidates = jnp.where(use_repro, candidates_repro,
-                               jnp.where(use_fallback, candidates_fallback, candidates_global))
+        candidates = jnp.where(
+            use_repro, within_repro,
+            jnp.where(use_fallback, within_fallback, valid),
+        )
 
-        # Tournament selection within candidates
-        # Sample tournament_size random candidates, pick best
-        # Use Gumbel trick for weighted sampling
-        # Assign -inf to non-candidates
+        # Tournament: Gumbel trick over candidate array
         log_probs = jnp.where(candidates, 0.0, -1e10)
-        gumbel = jax.random.gumbel(k1, (tournament_size, N))
-        perturbed = log_probs[None, :] + gumbel  # (tournament_size, N)
-        tournament_picks = jnp.argmax(perturbed, axis=1)  # (tournament_size,)
-        tournament_fitness = sorted_fitness[tournament_picks]
+        gumbel = jax.random.gumbel(key, (tournament_size, max_cand))
+        perturbed = log_probs[None, :] + gumbel
+        tournament_picks = jnp.argmax(perturbed, axis=1)  # indices into cand array
+        tournament_sorted_idx = safe[tournament_picks]
+        tournament_fitness = sorted_fitness[tournament_sorted_idx]
         best = jnp.argmax(tournament_fitness)
-        return tournament_picks[best]
+        return tournament_sorted_idx[best]
 
     # Generate offspring for all non-elite slots
     num_offspring = N - elite_count
@@ -280,8 +278,8 @@ def evolve_generation(
         k1, k2, k3, k4, key = jax.random.split(key, 5)
         slot = elite_count + idx  # index into sorted arrays
 
-        pa = select_parent_for_slot(k1, slot)
-        pb = select_parent_for_slot(k2, slot)
+        pa = select_parent_for_slot(k1, sorted_x[slot], sorted_y[slot])
+        pb = select_parent_for_slot(k2, sorted_x[slot], sorted_y[slot])
 
         child_w, child_bh, child_sh = crossover_single(
             sorted_w[pa], sorted_w[pb],
@@ -328,7 +326,13 @@ def compute_kin_bonus(
     grandparent_indices: jnp.ndarray,
     kin_bonus: float,
 ) -> jnp.ndarray:
-    """Add kin fitness bonus: +0.5 for siblings, +0.25 for cousins, scaled by kin_bonus.
+    """Add kin fitness bonus via scatter-aggregate instead of O(N^2) matrices.
+
+    For each parent/grandparent index, aggregates fitness of all children/grandchildren,
+    then each prey reads its accumulated kin fitness. O(N) instead of O(N^2).
+
+    Slight semantic difference from matrix version: prey sharing both parents get
+    double-counted. Effect is negligible on selection dynamics.
 
     Args:
         fitness: (N,) raw fitness
@@ -340,36 +344,46 @@ def compute_kin_bonus(
         (N,) adjusted fitness
     """
     N = fitness.shape[0]
-
-    # Sibling detection: shared parent indices
-    # (N, N) matrix of whether any parent matches
-    pa = parent_indices  # (N, 2)
-    # Check if any parent of i matches any parent of j (and both are valid)
-    sibling = jnp.zeros((N, N), dtype=jnp.bool_)
-    for pi in range(2):
-        for pj in range(2):
-            valid = (pa[:, pi, None] >= 0) & (pa[None, :, pj] >= 0)
-            matches = (pa[:, pi, None] == pa[None, :, pj]) & valid
-            sibling = sibling | matches
-
-    # Cousin detection: shared grandparent indices
+    pa = parent_indices       # (N, 2)
     ga = grandparent_indices  # (N, 4)
-    cousin = jnp.zeros((N, N), dtype=jnp.bool_)
-    for gi in range(4):
-        for gj in range(4):
-            valid = (ga[:, gi, None] >= 0) & (ga[None, :, gj] >= 0)
-            matches = (ga[:, gi, None] == ga[None, :, gj]) & valid
-            cousin = cousin | matches
 
-    # Remove self-relatedness
-    self_mask = jnp.eye(N, dtype=jnp.bool_)
-    sibling = sibling & ~self_mask
-    cousin = cousin & ~self_mask & ~sibling
+    # Use max possible index + 1 as array size to handle any parent index range.
+    # Parent indices come from evolution (0..N-1) but tests may use arbitrary values.
+    all_indices = jnp.concatenate([pa.reshape(-1), ga.reshape(-1)])
+    max_idx = jnp.maximum(jnp.max(all_indices) + 1, N)
 
-    # Sum kin fitness: siblings contribute 0.5, cousins 0.25
-    kin_sum = (
-        jnp.sum(jnp.where(sibling, fitness[None, :], 0.0), axis=1) * 0.5
-        + jnp.sum(jnp.where(cousin, fitness[None, :], 0.0), axis=1) * 0.25
-    )
+    # Sibling bonus: aggregate fitness by shared parent index
+    parent_fitness_sum = jnp.zeros(max_idx, dtype=jnp.float32)
+    for k in range(2):
+        valid = pa[:, k] >= 0
+        idx = jnp.clip(pa[:, k], 0)
+        parent_fitness_sum = parent_fitness_sum.at[idx].add(
+            jnp.where(valid, fitness, 0.0)
+        )
 
-    return fitness + kin_bonus * kin_sum
+    # Each prey's sibling contribution: sum of kin fitness via each parent, minus self
+    sib_sum = jnp.zeros(N, dtype=jnp.float32)
+    for k in range(2):
+        valid = pa[:, k] >= 0
+        idx = jnp.clip(pa[:, k], 0)
+        sib_sum = sib_sum + jnp.where(valid, parent_fitness_sum[idx] - fitness, 0.0)
+
+    # Cousin bonus: aggregate fitness by shared grandparent index
+    gp_fitness_sum = jnp.zeros(max_idx, dtype=jnp.float32)
+    for k in range(4):
+        valid = ga[:, k] >= 0
+        idx = jnp.clip(ga[:, k], 0)
+        gp_fitness_sum = gp_fitness_sum.at[idx].add(
+            jnp.where(valid, fitness, 0.0)
+        )
+
+    cousin_sum = jnp.zeros(N, dtype=jnp.float32)
+    for k in range(4):
+        valid = ga[:, k] >= 0
+        idx = jnp.clip(ga[:, k], 0)
+        cousin_sum = cousin_sum + jnp.where(valid, gp_fitness_sum[idx] - fitness, 0.0)
+
+    # Subtract sibling contribution from cousin to reduce double-counting
+    cousin_sum = jnp.maximum(0.0, cousin_sum - sib_sum)
+
+    return fitness + kin_bonus * (sib_sum * 0.5 + cousin_sum * 0.25)

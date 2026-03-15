@@ -19,8 +19,10 @@ from semgpu.brain import (
     batched_forward,
     softmax_emit,
 )
-from semgpu.signal import receive_signals
+from semgpu.signal import receive_signals_grid
 from semgpu.spatial import (
+    build_cell_grid,
+    has_neighbor_in_radius,
     move_zones,
     nearest_in_grid,
     nearest_zone_edge_dist,
@@ -206,10 +208,15 @@ def init_world(
     )
 
 
+PREY_MAX_PER_CELL = 32
+
+
 def build_inputs(
     state: WorldState,
     grid_size: int,
     signal_range: float,
+    prey_cells: jnp.ndarray | None = None,
+    prey_counts: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Build (N, 36) input vectors for all prey.
 
@@ -243,14 +250,14 @@ def build_inputs(
     inputs = inputs.at[:, 4].set(jnp.where(has_food, food_dy / gs, 0.0))
     inputs = inputs.at[:, 5].set(jnp.where(has_food, jnp.minimum(food_dist / gs, 1.0), 0.0))
 
-    # 6-8: nearest ally (dx, dy, distance)
+    # 6-8: nearest ally (dx, dy, distance) - uses cell grid to avoid O(N^2)
     prey_indices = jnp.arange(N, dtype=jnp.int32)
     alive_prey_x = jnp.where(state.alive, state.prey_x, -grid_size * 10)
     alive_prey_y = jnp.where(state.alive, state.prey_y, -grid_size * 10)
     ally_idx, ally_dx, ally_dy = nearest_in_grid(
         state.prey_x, state.prey_y,
         alive_prey_x, alive_prey_y,
-        None, None,
+        prey_cells, prey_counts,
         grid_size, grid_size // 2,
         prey_indices,  # skip self
     )
@@ -261,7 +268,7 @@ def build_inputs(
     inputs = inputs.at[:, 8].set(jnp.where(has_ally, jnp.minimum(ally_dist / gs, 1.0), 1.0))
 
     # 9-26: signal inputs (6 symbols * 3 = 18)
-    sig_inputs = receive_signals(
+    sig_inputs = receive_signals_grid(
         state.prey_x, state.prey_y,
         state.sig_x, state.sig_y, state.sig_symbol, state.sig_tick,
         state.sig_valid, state.tick,
@@ -322,8 +329,13 @@ def step(
         grid_size,
     )
 
+    # Build prey cell grid (1x1 cells) - used for ally nearest + cooperative eating
+    prey_cells, prey_counts = build_cell_grid(
+        state.prey_x, state.prey_y, state.alive, grid_size, PREY_MAX_PER_CELL,
+    )
+
     # Build inputs and run brains
-    inputs = build_inputs(state, grid_size, signal_range)
+    inputs = build_inputs(state, grid_size, signal_range, prey_cells, prey_counts)
 
     actions_raw, signals_raw, mem_write = batched_forward(
         state.weights, state.base_hidden, state.signal_hidden, inputs
@@ -407,15 +419,13 @@ def step(
     is_patch = state.food_is_patch[jnp.clip(food_target, 0)]
 
     # Cooperative check: for each eating prey, is there another alive prey within Chebyshev 2?
-    # Brute force: pairwise Chebyshev distances
-    cheb_dx = jnp.abs(wrap_delta(state.prey_x[:, None], state.prey_x[None, :], grid_size))
-    cheb_dy = jnp.abs(wrap_delta(state.prey_y[:, None], state.prey_y[None, :], grid_size))
-    cheb_dist = jnp.maximum(cheb_dx, cheb_dy)
-    # Mask self and dead
-    self_mask = jnp.eye(N, dtype=jnp.bool_)
-    has_partner = jnp.any(
-        (cheb_dist <= 2) & ~self_mask & state.alive[None, :],
-        axis=1,
+    prey_indices = jnp.arange(N, dtype=jnp.int32)
+    has_partner = has_neighbor_in_radius(
+        state.prey_x, state.prey_y,
+        prey_cells,
+        state.prey_x, state.prey_y, state.alive,
+        grid_size, 2,
+        prey_indices,
     )
 
     can_eat = can_eat & (~is_patch | has_partner)
