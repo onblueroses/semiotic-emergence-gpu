@@ -71,62 +71,67 @@ def _gaussian_noise(key: jnp.ndarray, shape: tuple, sigma: float) -> jnp.ndarray
 def _build_mutation_mask(base_hidden: jnp.ndarray, signal_hidden: jnp.ndarray) -> jnp.ndarray:
     """Build a per-weight mutation mask respecting scoping.
 
+    Vectorized: computes segment membership and row/col position for all weights
+    at once, replacing 260 Python loop iterations with ~10 vectorized ops.
+
     Returns: (MAX_GENOME_LEN,) bool mask of which weights to mutate.
     """
     bh_scope = jnp.minimum(base_hidden + MUTATION_HEADROOM, MAX_BASE_HIDDEN)
     sh_scope = jnp.minimum(signal_hidden + MUTATION_HEADROOM, MAX_SIGNAL_HIDDEN)
 
-    mask = jnp.zeros(MAX_GENOME_LEN, dtype=jnp.bool_)
     idx = jnp.arange(MAX_GENOME_LEN)
+    mask = jnp.zeros(MAX_GENOME_LEN, dtype=jnp.bool_)
 
-    # Input -> base hidden: rows=INPUTS, cols=MAX_BASE_HIDDEN, scope cols by bh
-    for i in range(INPUTS):
-        start = SEG_INPUT_BASE + i * MAX_BASE_HIDDEN
-        in_segment = (idx >= start) & (idx < start + MAX_BASE_HIDDEN)
-        col = idx - start
-        mask = mask | (in_segment & (col < bh_scope))
+    # Helper: for a 2D block at offset with (rows, cols), compute col < col_scope
+    def _col_scoped(seg_start, rows, cols, col_scope):
+        seg_end = seg_start + rows * cols
+        in_seg = (idx >= seg_start) & (idx < seg_end)
+        col = (idx - seg_start) % cols
+        return in_seg & (col < col_scope)
 
-    # Base hidden biases: scope by bh
-    in_seg = (idx >= SEG_BASE_BIAS) & (idx < SEG_BASE_BIAS + MAX_BASE_HIDDEN)
-    mask = mask | (in_seg & ((idx - SEG_BASE_BIAS) < bh_scope))
+    # Helper: for a 2D block, compute row < row_scope
+    def _row_scoped(seg_start, rows, cols, row_scope):
+        seg_end = seg_start + rows * cols
+        in_seg = (idx >= seg_start) & (idx < seg_end)
+        row = (idx - seg_start) // cols
+        return in_seg & (row < row_scope)
 
-    # Base -> movement: rows=MAX_BASE_HIDDEN, cols=MOVEMENT_OUTPUTS, scope rows by bh
-    for h in range(MAX_BASE_HIDDEN):
-        start = SEG_BASE_MOVE + h * MOVEMENT_OUTPUTS
-        in_seg = (idx >= start) & (idx < start + MOVEMENT_OUTPUTS)
-        mask = mask | (in_seg & (h < bh_scope))
+    # Helper: both row and col scoped
+    def _row_col_scoped(seg_start, rows, cols, row_scope, col_scope):
+        seg_end = seg_start + rows * cols
+        in_seg = (idx >= seg_start) & (idx < seg_end)
+        off = idx - seg_start
+        return in_seg & ((off // cols) < row_scope) & ((off % cols) < col_scope)
 
-    # Movement biases: always mutate all
-    mask = mask | ((idx >= SEG_MOVE_BIAS) & (idx < SEG_MOVE_BIAS + MOVEMENT_OUTPUTS))
+    # Helper: 1D bias segment scoped by size
+    def _bias_scoped(seg_start, size, scope):
+        in_seg = (idx >= seg_start) & (idx < seg_start + size)
+        return in_seg & ((idx - seg_start) < scope)
 
-    # Base -> signal hidden: scope rows by bh, cols by sh
-    for b in range(MAX_BASE_HIDDEN):
-        start = SEG_BASE_SIGHID + b * MAX_SIGNAL_HIDDEN
-        in_seg = (idx >= start) & (idx < start + MAX_SIGNAL_HIDDEN)
-        col = idx - start
-        mask = mask | (in_seg & (b < bh_scope) & (col < sh_scope))
+    # Helper: always-on bias segment
+    def _bias_all(seg_start, size):
+        return (idx >= seg_start) & (idx < seg_start + size)
 
-    # Signal hidden biases: scope by sh
-    in_seg = (idx >= SEG_SIGHID_BIAS) & (idx < SEG_SIGHID_BIAS + MAX_SIGNAL_HIDDEN)
-    mask = mask | (in_seg & ((idx - SEG_SIGHID_BIAS) < sh_scope))
-
-    # Signal hidden -> signal output: scope rows by sh
-    for s in range(MAX_SIGNAL_HIDDEN):
-        start = SEG_SIGHID_SIGOUT + s * SIGNAL_OUTPUTS
-        in_seg = (idx >= start) & (idx < start + SIGNAL_OUTPUTS)
-        mask = mask | (in_seg & (s < sh_scope))
-
-    # Signal output biases: always mutate all
-    mask = mask | ((idx >= SEG_SIGOUT_BIAS) & (idx < SEG_SIGOUT_BIAS + SIGNAL_OUTPUTS))
-
-    # Base -> memory: scope rows by bh
-    for h in range(MAX_BASE_HIDDEN):
-        start = SEG_BASE_MEM + h * MEMORY_OUTPUTS
-        in_seg = (idx >= start) & (idx < start + MEMORY_OUTPUTS)
-        mask = mask | (in_seg & (h < bh_scope))
-
-    # Memory biases: always mutate all
-    mask = mask | ((idx >= SEG_MEM_BIAS) & (idx < SEG_MEM_BIAS + MEMORY_OUTPUTS))
+    # Input -> base hidden: cols scoped by bh
+    mask = mask | _col_scoped(SEG_INPUT_BASE, INPUTS, MAX_BASE_HIDDEN, bh_scope)
+    # Base hidden biases
+    mask = mask | _bias_scoped(SEG_BASE_BIAS, MAX_BASE_HIDDEN, bh_scope)
+    # Base -> movement: rows scoped by bh
+    mask = mask | _row_scoped(SEG_BASE_MOVE, MAX_BASE_HIDDEN, MOVEMENT_OUTPUTS, bh_scope)
+    # Movement biases: always
+    mask = mask | _bias_all(SEG_MOVE_BIAS, MOVEMENT_OUTPUTS)
+    # Base -> signal hidden: rows by bh, cols by sh
+    mask = mask | _row_col_scoped(SEG_BASE_SIGHID, MAX_BASE_HIDDEN, MAX_SIGNAL_HIDDEN, bh_scope, sh_scope)
+    # Signal hidden biases
+    mask = mask | _bias_scoped(SEG_SIGHID_BIAS, MAX_SIGNAL_HIDDEN, sh_scope)
+    # Signal hidden -> signal output: rows by sh
+    mask = mask | _row_scoped(SEG_SIGHID_SIGOUT, MAX_SIGNAL_HIDDEN, SIGNAL_OUTPUTS, sh_scope)
+    # Signal output biases: always
+    mask = mask | _bias_all(SEG_SIGOUT_BIAS, SIGNAL_OUTPUTS)
+    # Base -> memory: rows by bh
+    mask = mask | _row_scoped(SEG_BASE_MEM, MAX_BASE_HIDDEN, MEMORY_OUTPUTS, bh_scope)
+    # Memory biases: always
+    mask = mask | _bias_all(SEG_MEM_BIAS, MEMORY_OUTPUTS)
 
     return mask
 
@@ -266,17 +271,13 @@ def evolve_generation(
         best = jnp.argmax(tournament_fitness)
         return tournament_sorted_idx[best]
 
-    # Generate offspring for all non-elite slots
+    # Generate offspring for all non-elite slots - vmap for GPU parallelism
     num_offspring = N - elite_count
-    keys = jax.random.split(key, num_offspring * 3 + 1)
-    offspring_keys = keys[:-1].reshape(num_offspring, 3, -1)
-    main_key = keys[-1]
+    offspring_keys = jax.random.split(key, num_offspring)
 
-    # Process each offspring slot
-    def make_offspring(carry, idx):
-        key = carry
-        k1, k2, k3, k4, key = jax.random.split(key, 5)
-        slot = elite_count + idx  # index into sorted arrays
+    def make_one_offspring(slot_idx, key):
+        k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+        slot = elite_count + slot_idx
 
         pa = select_parent_for_slot(k1, sorted_x[slot], sorted_y[slot])
         pb = select_parent_for_slot(k2, sorted_x[slot], sorted_y[slot])
@@ -290,7 +291,6 @@ def evolve_generation(
         child_w, child_bh, child_sh = mutate_single(child_w, child_bh, child_sh, sigma, k4)
 
         # Jitter position
-        k5, k6, key = jax.random.split(key, 3)
         jx = jax.random.randint(k5, (), -OFFSPRING_JITTER, OFFSPRING_JITTER + 1)
         jy = jax.random.randint(k6, (), -OFFSPRING_JITTER, OFFSPRING_JITTER + 1)
         child_x = (sorted_x[slot] + jx) % grid_size
@@ -303,10 +303,11 @@ def evolve_generation(
             sorted_parents[pb, 0], sorted_parents[pb, 1],
         ], dtype=jnp.int32)
 
-        return key, (child_x, child_y, child_w, child_bh, child_sh, child_parents, child_grandparents)
+        return child_x, child_y, child_w, child_bh, child_sh, child_parents, child_grandparents
 
-    _, offspring = jax.lax.scan(make_offspring, main_key, jnp.arange(num_offspring))
-    off_x, off_y, off_w, off_bh, off_sh, off_parents, off_grandparents = offspring
+    off_x, off_y, off_w, off_bh, off_sh, off_parents, off_grandparents = jax.vmap(
+        make_one_offspring
+    )(jnp.arange(num_offspring), offspring_keys)
 
     # Combine elites + offspring
     new_x = jnp.concatenate([sorted_x[:elite_count], off_x])
