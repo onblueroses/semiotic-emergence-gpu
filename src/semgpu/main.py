@@ -198,142 +198,147 @@ def run_seed(
             rank_order = jnp.argsort(jnp.argsort(fitness))
             ranked_fitness = rank_order.astype(jnp.float32) + 1.0
 
-            # --- Compute metrics (host-side numpy) ---
-            fs = result.final_state
-            mi_counts_np = np.asarray(fs.mi_counts)
-            symbol_counts_np = np.asarray(fs.symbol_counts)
-            recv_counts_np = np.asarray(fs.recv_counts)
+            # --- Compute metrics only on metrics_interval generations ---
+            collect_metrics = (gen % params.metrics_interval == 0) or (gen == generations - 1)
 
-            avg_fit = float(jnp.mean(result.fitness))
-            max_fit = float(jnp.max(result.fitness))
-            total_sig = int(result.total_signals)
-            zd = int(result.zone_deaths)
+            if collect_metrics:
+                fs = result.final_state
+                mi_counts_np = np.asarray(fs.mi_counts)
+                symbol_counts_np = np.asarray(fs.symbol_counts)
+                recv_counts_np = np.asarray(fs.recv_counts)
 
-            # Sender metrics
-            iconicity = compute_iconicity(
-                int(fs.iconicity_in_zone),
-                int(symbol_counts_np.sum()),
-                int(fs.m_ticks_in_zone),
-                int(fs.m_total_prey_ticks),
-            )
-            mutual_info = compute_mutual_info(mi_counts_np)
-            sig_entropy = compute_signal_entropy(symbol_counts_np)
+                avg_fit = float(jnp.mean(result.fitness))
+                max_fit = float(jnp.max(result.fitness))
+                total_sig = int(result.total_signals)
+                zd = int(result.zone_deaths)
 
-            last_mi_counts = mi_counts_np
-            last_avg_fit = avg_fit
-            last_max_fit = max_fit
-            last_mutual_info = mutual_info
+                # Sender metrics
+                iconicity = compute_iconicity(
+                    int(fs.iconicity_in_zone),
+                    int(symbol_counts_np.sum()),
+                    int(fs.m_ticks_in_zone),
+                    int(fs.m_total_prey_ticks),
+                )
+                mutual_info = compute_mutual_info(mi_counts_np)
+                sig_entropy = compute_signal_entropy(symbol_counts_np)
 
-            # Receiver JSD
-            jsd_no_pred, jsd_pred = compute_receiver_jsd(recv_counts_np)
+                last_mi_counts = mi_counts_np
+                last_avg_fit = avg_fit
+                last_max_fit = max_fit
+                last_mutual_info = mutual_info
 
-            # Silence correlation
-            spt = np.asarray(fs.per_tick_signals)
-            apt = np.asarray(fs.per_tick_alive)
-            mzd = np.asarray(fs.per_tick_min_zdist)
-            norm_sig_rate = np.where(apt > 0, spt / apt, 0.0)
-            silence_corr = pearson(norm_sig_rate, mzd)
+                # Receiver JSD
+                jsd_no_pred, jsd_pred = compute_receiver_jsd(recv_counts_np)
 
-            # Sender fit correlation
-            fitness_np = np.asarray(result.fitness)
-            ticks_alive_np = np.asarray(result.ticks_alive)
-            signals_sent_np = np.asarray(fs.prey_signals_sent)
-            signal_rate_per_prey = np.where(
-                ticks_alive_np > 0,
-                signals_sent_np.astype(np.float64) / ticks_alive_np,
-                0.0,
-            )
-            sender_fit_corr = pearson(signal_rate_per_prey, fitness_np)
+                # Silence correlation
+                spt = np.asarray(fs.per_tick_signals)
+                apt = np.asarray(fs.per_tick_alive)
+                mzd = np.asarray(fs.per_tick_min_zdist)
+                norm_sig_rate = np.where(apt > 0, spt / apt, 0.0)
+                silence_corr = pearson(norm_sig_rate, mzd)
 
-            # Trajectory JSD and fluctuation ratio
-            curr_norm = normalize_matrix(mi_counts_np)
-            if prev_norm_matrix is not None and curr_norm is not None:
-                traj_jsd_val = trajectory_jsd(prev_norm_matrix, curr_norm)
-            else:
-                traj_jsd_val = 0.0
-            traj_jsd_history.append(traj_jsd_val)
-            traj_fluct = rolling_fluctuation_ratio(traj_jsd_history, FLUCT_WINDOW)
-            if curr_norm is not None:
-                prev_norm_matrix = curr_norm
+                # Sender fit correlation
+                fitness_np = np.asarray(result.fitness)
+                ticks_alive_np = np.asarray(result.ticks_alive)
+                signals_sent_np = np.asarray(fs.prey_signals_sent)
+                signal_rate_per_prey = np.where(
+                    ticks_alive_np > 0,
+                    signals_sent_np.astype(np.float64) / ticks_alive_np,
+                    0.0,
+                )
+                sender_fit_corr = pearson(signal_rate_per_prey, fitness_np)
 
-            # Three-way coupling
-            recv_with_np = np.asarray(fs.prey_recv_with)
-            recv_without_np = np.asarray(fs.prey_recv_without)
-            total_w = recv_with_np.reshape(N, -1).sum(axis=1)
-            total_wo = recv_without_np.reshape(N, -1).sum(axis=1)
-            total_all = total_w + total_wo
-            reception_rates = np.where(total_all > 0, total_w / total_all, 0.0)
-            receiver_fit_corr = pearson(reception_rates, fitness_np)
+                # Trajectory JSD and fluctuation ratio
+                curr_norm = normalize_matrix(mi_counts_np)
+                if prev_norm_matrix is not None and curr_norm is not None:
+                    traj_jsd_val = trajectory_jsd(prev_norm_matrix, curr_norm)
+                else:
+                    traj_jsd_val = 0.0
+                traj_jsd_history.append(traj_jsd_val)
+                traj_fluct = rolling_fluctuation_ratio(traj_jsd_history, FLUCT_WINDOW)
+                if curr_norm is not None:
+                    prev_norm_matrix = curr_norm
 
-            per_prey_jsd = np.array([
-                per_prey_receiver_jsd(recv_with_np[i], recv_without_np[i])
-                for i in range(N)
-            ])
-            response_fit_corr = pearson(per_prey_jsd, fitness_np)
+                # Three-way coupling
+                recv_with_np = np.asarray(fs.prey_recv_with)
+                recv_without_np = np.asarray(fs.prey_recv_without)
+                total_w = recv_with_np.reshape(N, -1).sum(axis=1)
+                total_wo = recv_without_np.reshape(N, -1).sum(axis=1)
+                total_all = total_w + total_wo
+                reception_rates = np.where(total_all > 0, total_w / total_all, 0.0)
+                receiver_fit_corr = pearson(reception_rates, fitness_np)
 
-            # Silence onset
-            onset_np = np.asarray(fs.onset_actions)
-            present_np = np.asarray(fs.present_actions)
-            silence_onset_jsd, silence_move_delta = compute_silence_onset_metrics(
-                onset_np, present_np,
-            )
+                per_prey_jsd = np.array([
+                    per_prey_receiver_jsd(recv_with_np[i], recv_without_np[i])
+                    for i in range(N)
+                ])
+                response_fit_corr = pearson(per_prey_jsd, fitness_np)
 
-            # Brain size stats
-            avg_bh = float(jnp.mean(base_hidden))
-            min_bh = int(jnp.min(base_hidden))
-            max_bh = int(jnp.max(base_hidden))
-            avg_sh = float(jnp.mean(signal_hidden))
-            min_sh = int(jnp.min(signal_hidden))
-            max_sh = int(jnp.max(signal_hidden))
+                # Silence onset
+                onset_np = np.asarray(fs.onset_actions)
+                present_np = np.asarray(fs.present_actions)
+                silence_onset_jsd, silence_move_delta = compute_silence_onset_metrics(
+                    onset_np, present_np,
+                )
 
-            # Write output.csv row
-            row = [
-                gen, f"{avg_fit:.4f}", f"{max_fit:.4f}", total_sig,
-                f"{iconicity:.6f}", f"{mutual_info:.6f}",
-                f"{jsd_no_pred:.6f}", f"{jsd_pred:.6f}",
-                f"{silence_corr:.6f}", f"{sender_fit_corr:.6f}",
-                f"{traj_fluct:.6f}",
-                f"{receiver_fit_corr:.6f}", f"{response_fit_corr:.6f}",
-                f"{silence_onset_jsd:.6f}", f"{silence_move_delta:.6f}",
-                f"{avg_bh:.1f}", min_bh, max_bh,
-                f"{avg_sh:.1f}", min_sh, max_sh,
-                zd, f"{sig_entropy:.6f}",
-            ]
-            writer.writerow(row)
+                # Brain size stats
+                avg_bh = float(jnp.mean(base_hidden))
+                min_bh = int(jnp.min(base_hidden))
+                max_bh = int(jnp.max(base_hidden))
+                avg_sh = float(jnp.mean(signal_hidden))
+                min_sh = int(jnp.min(signal_hidden))
+                max_sh = int(jnp.max(signal_hidden))
 
-            # Write trajectory.csv row
-            n_pairs = 6 * 5 // 2  # 15
-            if curr_norm is not None:
-                per_sym_jsd = compute_per_symbol_jsd(recv_counts_np)
-                contrast = inter_symbol_jsd(curr_norm)
-            else:
-                per_sym_jsd = np.zeros(6)
-                contrast = [0.0] * n_pairs
+                # Write output.csv row
+                row = [
+                    gen, f"{avg_fit:.4f}", f"{max_fit:.4f}", total_sig,
+                    f"{iconicity:.6f}", f"{mutual_info:.6f}",
+                    f"{jsd_no_pred:.6f}", f"{jsd_pred:.6f}",
+                    f"{silence_corr:.6f}", f"{sender_fit_corr:.6f}",
+                    f"{traj_fluct:.6f}",
+                    f"{receiver_fit_corr:.6f}", f"{response_fit_corr:.6f}",
+                    f"{silence_onset_jsd:.6f}", f"{silence_move_delta:.6f}",
+                    f"{avg_bh:.1f}", min_bh, max_bh,
+                    f"{avg_sh:.1f}", min_sh, max_sh,
+                    zd, f"{sig_entropy:.6f}",
+                ]
+                writer.writerow(row)
 
-            traj_row = [gen]
-            # Flatten contingency matrix (s0d0, s0d1, ..., s5d3)
-            for s in range(6):
-                for d in range(4):
-                    traj_row.append(int(mi_counts_np[s, d]))
-            for s in range(6):
-                traj_row.append(f"{per_sym_jsd[s]:.6f}")
-            traj_row.append(f"{traj_jsd_val:.6f}")
-            for v in contrast:
-                traj_row.append(f"{v:.6f}")
-            traj_writer.writerow(traj_row)
+                # Write trajectory.csv row
+                n_pairs = 6 * 5 // 2  # 15
+                if curr_norm is not None:
+                    per_sym_jsd = compute_per_symbol_jsd(recv_counts_np)
+                    contrast = inter_symbol_jsd(curr_norm)
+                else:
+                    per_sym_jsd = np.zeros(6)
+                    contrast = [0.0] * n_pairs
 
-            # Write input_mi.csv row
-            evt_count = int(fs.evt_count)
-            if evt_count > 0:
-                evt_sym_np = np.asarray(fs.evt_symbol)[:evt_count]
-                evt_inp_np = np.asarray(fs.evt_inputs)[:evt_count]
-                input_mi_vals = compute_input_mi(evt_sym_np, evt_inp_np)
-            else:
-                input_mi_vals = np.zeros(36)
-            imi_row = [gen] + [f"{v:.6f}" for v in input_mi_vals]
-            imi_writer.writerow(imi_row)
+                traj_row = [gen]
+                for s in range(6):
+                    for d in range(4):
+                        traj_row.append(int(mi_counts_np[s, d]))
+                for s in range(6):
+                    traj_row.append(f"{per_sym_jsd[s]:.6f}")
+                traj_row.append(f"{traj_jsd_val:.6f}")
+                for v in contrast:
+                    traj_row.append(f"{v:.6f}")
+                traj_writer.writerow(traj_row)
 
-            if gen % 10 == 0 or gen == generations - 1:
+                # Write input_mi.csv row
+                evt_count = int(fs.evt_count)
+                if evt_count > 0:
+                    evt_sym_np = np.asarray(fs.evt_symbol)[:evt_count]
+                    evt_inp_np = np.asarray(fs.evt_inputs)[:evt_count]
+                    input_mi_vals = compute_input_mi(evt_sym_np, evt_inp_np)
+                else:
+                    input_mi_vals = np.zeros(36)
+                imi_row = [gen] + [f"{v:.6f}" for v in input_mi_vals]
+                imi_writer.writerow(imi_row)
+
+            # Progress printing (on metrics gens, or every 100 gens as heartbeat)
+            print_gen = collect_metrics and (gen % 10 == 0 or gen == generations - 1)
+            heartbeat = (not collect_metrics) and (gen % 100 == 0)
+            if print_gen:
                 elapsed = time.time() - gen_start
                 print(
                     f"Gen {gen:>5}: avg={avg_fit:.1f} max={max_fit:.1f} "
@@ -341,6 +346,9 @@ def run_seed(
                     f"ico={iconicity:.3f} zd={zd} ent={sig_entropy:.3f} "
                     f"({elapsed:.2f}s)"
                 )
+            elif heartbeat:
+                elapsed = time.time() - gen_start
+                print(f"Gen {gen:>5}: ({elapsed:.2f}s)")
 
             # Evolve
             (prey_x, prey_y, weights, base_hidden, signal_hidden,
