@@ -433,34 +433,21 @@ def step(
     # Conflict resolution: shuffled priority (random permutation)
     # For each food item, only the first prey to claim it gets it
     priority = jax.random.permutation(k1, N)
-    # For each food target, find the highest-priority (lowest index in permutation) prey
     F = state.food_x.shape[0]
-    # Scatter: each eating prey writes its priority to its food target
-    food_best_priority = jnp.full(F, N + 1, dtype=jnp.int32)  # no one yet
-    food_best_prey = jnp.full(F, -1, dtype=jnp.int32)
-
-    # Use min scatter: prey with lowest priority value wins
+    food_best_priority = jnp.full(F, N + 1, dtype=jnp.int32)
     clipped_target = jnp.clip(food_target, 0, F - 1)
-    prey_priority = jnp.where(can_eat, priority, N + 1)
 
-    # For conflict resolution, use segment_min-like approach
-    # Scatter min priority per food
+    # Scatter min priority per food - lowest priority value wins
     food_best_priority = food_best_priority.at[clipped_target].min(
         jnp.where(can_eat, priority, N + 1)
     )
-    # Each prey checks if it won
     won_food = can_eat & (priority == food_best_priority[clipped_target])
 
     # Apply eating
     new_energy = jnp.where(won_food, jnp.minimum(state.energy + 0.3, 1.0), state.energy)
     new_food_eaten = state.food_eaten + won_food.astype(jnp.int32)
-    new_food_alive = state.food_alive.at[clipped_target].set(
-        state.food_alive[clipped_target] & ~won_food
-    )
-    # Count remaining food
-    # (Note: the above scatter may incorrectly set food_alive for non-eating prey
-    # because clipped_target defaults to 0 for non-eaters. Fix: only scatter for actual eaters)
-    # Recompute: mark eaten food
+    # Mark eaten food via boolean scatter (clipped_target defaults to 0 for non-eaters,
+    # so use won_food mask to avoid corrupting food 0)
     eaten_mask = jnp.zeros(F, dtype=jnp.bool_)
     eaten_mask = eaten_mask.at[clipped_target].set(
         eaten_mask[clipped_target] | won_food
