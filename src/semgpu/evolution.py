@@ -6,6 +6,8 @@ All operations vectorized for batch processing.
 
 from __future__ import annotations
 
+import functools  # noqa: F401 - used in jax.jit decorator
+
 import jax
 import jax.numpy as jnp
 
@@ -168,6 +170,10 @@ def mutate_single(
     return new_weights, new_bh, new_sh
 
 
+@functools.partial(jax.jit, static_argnames=[
+    'elite_count', 'tournament_size', 'sigma', 'grid_size',
+    'reproduction_radius', 'fallback_radius',
+])
 def evolve_generation(
     prey_x: jnp.ndarray,
     prey_y: jnp.ndarray,
@@ -321,6 +327,7 @@ def evolve_generation(
     return new_x, new_y, new_w, new_bh, new_sh, new_parents, new_grandparents
 
 
+@functools.partial(jax.jit, static_argnames=['kin_bonus'])
 def compute_kin_bonus(
     fitness: jnp.ndarray,
     parent_indices: jnp.ndarray,

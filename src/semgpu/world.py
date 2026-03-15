@@ -6,6 +6,7 @@ All operations are jittable - no Python control flow on traced values.
 
 from __future__ import annotations
 
+import functools
 from typing import NamedTuple
 
 import jax
@@ -612,6 +613,12 @@ class EvalResult(NamedTuple):
     final_state: WorldState       # for extracting signal events etc on host
 
 
+@functools.partial(jax.jit, static_argnames=[
+    'grid_size', 'signal_range', 'base_drain', 'signal_cost',
+    'zone_drain_rate', 'patch_ratio', 'food_count', 'signal_ticks',
+    'no_signals', 'max_signals', 'ticks_per_eval', 'mi_bins',
+    'zone_radius_scalar', 'max_events',
+])
 def evaluate_generation(
     state: WorldState,
     grid_size: int,
