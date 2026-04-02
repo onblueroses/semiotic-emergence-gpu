@@ -31,23 +31,25 @@ from semgpu.brain import (
 
 
 def test_genome_length():
-    assert MAX_GENOME_LEN == 5491
+    assert MAX_GENOME_LEN == 5683
 
 
 def test_segment_offsets_contiguous():
     assert SEG_MEM_BIAS + MEMORY_OUTPUTS == MAX_GENOME_LEN
 
 
-def test_segment_offsets_match_rust():
-    assert SEG_BASE_BIAS == 2304
-    assert SEG_BASE_MOVE == 2368
-    assert SEG_MOVE_BIAS == 2688
-    assert SEG_BASE_SIGHID == 2693
-    assert SEG_SIGHID_BIAS == 4741
-    assert SEG_SIGHID_SIGOUT == 4773
-    assert SEG_SIGOUT_BIAS == 4965
-    assert SEG_BASE_MEM == 4971
-    assert SEG_MEM_BIAS == 5483
+def test_segment_offsets_inputs39():
+    # All offsets shift by +192 (3 extra inputs * 64 base hidden) vs INPUTS=36
+    assert INPUTS == 39
+    assert SEG_BASE_BIAS == 2496   # 39*64
+    assert SEG_BASE_MOVE == 2560   # +64
+    assert SEG_MOVE_BIAS == 2880   # +64*5
+    assert SEG_BASE_SIGHID == 2885 # +5
+    assert SEG_SIGHID_BIAS == 4933 # +64*32
+    assert SEG_SIGHID_SIGOUT == 4965  # +32
+    assert SEG_SIGOUT_BIAS == 5157 # +32*6
+    assert SEG_BASE_MEM == 5163    # +6
+    assert SEG_MEM_BIAS == 5675    # +64*8
 
 
 def test_zero_weights_zero_output():

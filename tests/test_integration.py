@@ -28,6 +28,7 @@ def test_evaluate_generation_runs():
         max_signals=500,
         ticks_per_eval=50,
         max_events=1000,
+        max_deaths=n,
         key=key,
     )
 
@@ -74,6 +75,7 @@ def test_evaluate_generation_fitness_formula():
         max_signals=200,
         ticks_per_eval=100,
         max_events=1000,
+        max_deaths=n,
         key=key,
     )
 
@@ -119,6 +121,7 @@ def test_no_signals_mode():
         max_signals=100,
         ticks_per_eval=50,
         max_events=1000,
+        max_deaths=n,
         key=key,
     )
 

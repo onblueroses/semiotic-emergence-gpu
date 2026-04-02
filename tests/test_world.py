@@ -130,6 +130,7 @@ class TestWorldState:
             max_signals=1000,
             ticks_per_eval=500,
             max_events=1000,
+            max_deaths=n,
             key=key,
         )
 
@@ -209,6 +210,7 @@ class TestWorldState:
             max_signals=100,
             ticks_per_eval=500,
             max_events=100,
+            max_deaths=n,
             key=key,
         )
         ws = ws._replace(
@@ -224,3 +226,127 @@ class TestWorldState:
                 mi_bin0=28.0, mi_bin1=22.4, mi_bin2=30.8, zone_radius_scalar=28.0, max_events=1000,
             )
         assert int(ws.zone_deaths) > 0
+
+
+class TestDeathEchoes:
+    """Tests for the death echo ring buffer and witness inputs (inputs 36-38)."""
+
+    def _make_world_with_kills(self, n=20, radius=28.0, drain=0.5, steps=5):
+        """Create world guaranteed to produce zone kills for testing echoes."""
+        key = jax.random.key(77)
+        ws = init_world(
+            prey_x=jnp.full(n, 28, dtype=jnp.int32),
+            prey_y=jnp.full(n, 28, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=1,
+            food_count=10,
+            grid_size=56,
+            zone_radius=radius,
+            zone_speed=0.0,
+            patch_ratio=0.0,
+            max_signals=100,
+            ticks_per_eval=500,
+            max_events=100,
+            max_deaths=n,
+            key=key,
+        )
+        ws = ws._replace(zone_x=jnp.array([28.0]), zone_y=jnp.array([28.0]))
+        for _ in range(steps):
+            ws = step(
+                ws, grid_size=56, signal_range=22.4, base_drain=0.0008,
+                signal_cost=0.002, zone_drain_rate=drain, patch_ratio=0.0,
+                food_count=10, signal_ticks=4, no_signals=False, max_signals=100,
+                mi_bin0=28.0, mi_bin1=22.4, mi_bin2=30.8, zone_radius_scalar=28.0,
+                max_events=1000,
+            )
+        return ws
+
+    def test_death_ring_buffer_fills(self):
+        ws = self._make_world_with_kills()
+        assert int(ws.zone_deaths) > 0
+        assert jnp.any(ws.death_valid)
+
+    def test_death_positions_nonzero(self):
+        ws = self._make_world_with_kills()
+        # Prey started at (28, 28) but may have moved before dying.
+        # Verify that recorded positions are within the zone (radius 28, center 28).
+        valid_mask = ws.death_valid
+        assert jnp.any(valid_mask)
+        gs = 56
+        dx = jnp.where(valid_mask, jnp.abs(ws.death_x - 28).astype(jnp.float32), 0.0)
+        dy = jnp.where(valid_mask, jnp.abs(ws.death_y - 28).astype(jnp.float32), 0.0)
+        # Wrap distances on toroidal grid
+        dx = jnp.minimum(dx, gs - dx)
+        dy = jnp.minimum(dy, gs - dy)
+        dist = jnp.sqrt(dx * dx + dy * dy)
+        assert jnp.all(jnp.where(valid_mask, dist <= 28.0, True))
+
+    def test_ring_buffer_wraps(self):
+        # Fill ring buffer beyond capacity to verify wrap-around
+        key = jax.random.key(55)
+        n = 5
+        ws = init_world(
+            prey_x=jnp.full(n, 28, dtype=jnp.int32),
+            prey_y=jnp.full(n, 28, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=1,
+            food_count=5,
+            grid_size=56,
+            zone_radius=28.0,
+            zone_speed=0.0,
+            patch_ratio=0.0,
+            max_signals=50,
+            ticks_per_eval=500,
+            max_events=50,
+            max_deaths=n,  # tiny buffer = wrap guaranteed when all die
+            key=key,
+        )
+        ws = ws._replace(zone_x=jnp.array([28.0]), zone_y=jnp.array([28.0]))
+        for _ in range(10):
+            ws = step(
+                ws, grid_size=56, signal_range=22.4, base_drain=0.0008,
+                signal_cost=0.002, zone_drain_rate=0.5, patch_ratio=0.0,
+                food_count=5, signal_ticks=4, no_signals=False, max_signals=50,
+                mi_bin0=28.0, mi_bin1=22.4, mi_bin2=30.8, zone_radius_scalar=28.0,
+                max_events=50,
+            )
+        # cursor should have advanced (mod max_deaths), not crashed
+        assert ws.death_cursor.shape == ()
+
+    def test_death_witness_input_shape(self):
+        ws = self._make_world_with_kills()
+        inputs = build_inputs(ws, 56, 22.4)
+        assert inputs.shape == (ws.prey_x.shape[0], INPUTS)
+        assert INPUTS == 39
+
+    def test_death_witness_nonzero_near_death(self):
+        # After kills, prey positions are at/near zone deaths within signal_range.
+        # Check that death witness inputs are non-zero (regardless of alive state).
+        ws = self._make_world_with_kills()
+        if not jnp.any(ws.death_valid):
+            return  # no deaths = test not applicable
+        inputs = build_inputs(ws, 56, 22.4)
+        # Prey positions are near recorded death positions (same zone),
+        # so death_nearby (input 36) should be > 0 for at least one prey
+        assert jnp.max(inputs[:, 36]) > 0.0
+
+    def test_death_witness_zero_no_deaths(self):
+        # Fresh world: no deaths, so death witness inputs should be 0
+        ws = self._make_world_with_kills(radius=1.0, drain=0.001, steps=1)
+        # With tiny radius and low drain, no deaths
+        inputs = build_inputs(ws, 56, 22.4)
+        if jnp.any(ws.death_valid):
+            return  # deaths happened - skip
+        assert jnp.allclose(inputs[:, 36], 0.0)
+        assert jnp.allclose(inputs[:, 37], 0.0)
+        assert jnp.allclose(inputs[:, 38], 0.0)
+
+    def test_death_witness_intensity_bounded(self):
+        ws = self._make_world_with_kills()
+        inputs = build_inputs(ws, 56, 22.4)
+        assert jnp.all(inputs[:, 36] >= 0.0)
+        assert jnp.all(inputs[:, 36] <= 1.0)

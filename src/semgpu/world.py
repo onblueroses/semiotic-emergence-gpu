@@ -31,13 +31,16 @@ from semgpu.spatial import (
     zone_drain_amount,
 )
 
+# Death echo duration: number of ticks a zone death remains visible (matches Rust ECHO_DURATION=30)
+ECHO_DURATION = 30
+
 # Input layout offsets (must match Rust)
 SIGNAL_INPUT_START = 9
 MEMORY_INPUT_START = SIGNAL_INPUT_START + NUM_SYMBOLS * 3  # 27
 ENERGY_INPUT_IDX = MEMORY_INPUT_START + MEMORY_SIZE  # 35
 
 INPUT_NAMES = [
-    "zone_damage", "energy_delta", "dead_spare",
+    "zone_damage", "energy_delta", "freeze_pressure",
     "food_dx", "food_dy", "food_dist",
     "ally_dx", "ally_dy", "ally_dist",
     "sig0_str", "sig0_dx", "sig0_dy",
@@ -48,6 +51,7 @@ INPUT_NAMES = [
     "sig5_str", "sig5_dx", "sig5_dy",
     "mem0", "mem1", "mem2", "mem3", "mem4", "mem5", "mem6", "mem7",
     "energy",
+    "death_nearby", "death_dx", "death_dy",
 ]
 assert len(INPUT_NAMES) == INPUTS
 
@@ -64,7 +68,7 @@ class WorldState(NamedTuple):
     memory: jnp.ndarray          # (N, 8) float32
     ticks_alive: jnp.ndarray     # (N,) int32
     food_eaten: jnp.ndarray      # (N,) int32
-    weights: jnp.ndarray         # (N, 5491) float32
+    weights: jnp.ndarray         # (N, 5683) float32
     base_hidden: jnp.ndarray     # (N,) int32
     signal_hidden: jnp.ndarray   # (N,) int32
 
@@ -88,6 +92,13 @@ class WorldState(NamedTuple):
     sig_tick: jnp.ndarray        # (S,) int32
     sig_valid: jnp.ndarray       # (S,) bool
     sig_cursor: jnp.ndarray      # scalar int32, write position in ring buffer
+
+    # Death echo ring buffer (D = max_deaths = pop_size)
+    death_x: jnp.ndarray          # (D,) int32
+    death_y: jnp.ndarray          # (D,) int32
+    death_tick: jnp.ndarray       # (D,) int32 - tick when death occurred
+    death_valid: jnp.ndarray      # (D,) bool
+    death_cursor: jnp.ndarray     # scalar int32
 
     # Counters
     tick: jnp.ndarray             # scalar int32
@@ -115,7 +126,7 @@ class WorldState(NamedTuple):
     present_actions: jnp.ndarray    # (N, 2, 5) int32 - actions during signal
     # Event buffer for input_mi (ring buffer)
     evt_symbol: jnp.ndarray         # (E,) int32
-    evt_inputs: jnp.ndarray         # (E, 36) float32
+    evt_inputs: jnp.ndarray         # (E, 39) float32
     evt_cursor: jnp.ndarray         # scalar int32
     evt_count: jnp.ndarray          # scalar int32 - total events seen
 
@@ -135,6 +146,7 @@ def init_world(
     max_signals: int,
     ticks_per_eval: int,
     max_events: int,
+    max_deaths: int,
     key: jnp.ndarray,
 ) -> WorldState:
     """Initialize a WorldState for one generation evaluation."""
@@ -182,6 +194,11 @@ def init_world(
         sig_tick=jnp.zeros(max_signals, dtype=jnp.int32),
         sig_valid=jnp.zeros(max_signals, dtype=jnp.bool_),
         sig_cursor=jnp.int32(0),
+        death_x=jnp.zeros(max_deaths, dtype=jnp.int32),
+        death_y=jnp.zeros(max_deaths, dtype=jnp.int32),
+        death_tick=jnp.zeros(max_deaths, dtype=jnp.int32),
+        death_valid=jnp.zeros(max_deaths, dtype=jnp.bool_),
+        death_cursor=jnp.int32(0),
         tick=jnp.int32(0),
         signals_emitted=jnp.int32(0),
         zone_deaths=jnp.int32(0),
@@ -219,9 +236,9 @@ def build_inputs(
     prey_cells: jnp.ndarray | None = None,
     prey_counts: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    """Build (N, 36) input vectors for all prey.
+    """Build (N, 39) input vectors for all prey.
 
-    Layout: [zone_damage, energy_delta, spare, food(3), ally(3), signals(18), memory(8), energy]
+    Layout: [zone_damage, energy_delta, freeze_pressure, food(3), ally(3), signals(18), memory(8), energy, death_nearby, death_dx, death_dy]
     """
     N = state.prey_x.shape[0]
     gs = float(grid_size)
@@ -233,7 +250,7 @@ def build_inputs(
     # 1: energy_delta
     inputs = inputs.at[:, 1].set(state.energy - state.prev_energy)
 
-    # 2: spare (zero)
+    # 2: freeze_pressure - wired in Phase 2 (freeze zones); placeholder 0.0 until then
 
     # 3-5: nearest food (dx, dy, distance)
     alive_food_x = jnp.where(state.food_alive, state.food_x, -grid_size * 10)
@@ -282,6 +299,41 @@ def build_inputs(
 
     # 35: own energy
     inputs = inputs.at[:, ENERGY_INPUT_IDX].set(jnp.clip(state.energy, 0.0, 1.0))
+
+    # 36-38: death witness - nearest recent zone death within signal_range
+    # Intensity = spatial_decay * temporal_decay to nearest valid echo
+    D = state.death_x.shape[0]
+    current_tick = state.tick
+
+    # For each valid echo: spatial decay (1 - dist/signal_range), temporal decay (1 - age/ECHO_DURATION)
+    # dx/dy shape: (N, D) via broadcast
+    ddx = wrap_delta(
+        state.prey_x[:, None].astype(jnp.float32),
+        state.death_x[None, :].astype(jnp.float32),
+        grid_size,
+    )
+    ddy = wrap_delta(
+        state.prey_y[:, None].astype(jnp.float32),
+        state.death_y[None, :].astype(jnp.float32),
+        grid_size,
+    )
+    ddist = jnp.sqrt(ddx * ddx + ddy * ddy)  # (N, D)
+    spatial_decay = jnp.maximum(0.0, 1.0 - ddist / signal_range)  # (N, D)
+    age = (current_tick - state.death_tick[None, :]).astype(jnp.float32)  # (N, D)
+    temporal_decay = jnp.maximum(0.0, 1.0 - age / ECHO_DURATION)  # (N, D)
+    intensity = spatial_decay * temporal_decay  # (N, D)
+    # Mask invalid echoes
+    intensity = jnp.where(state.death_valid[None, :], intensity, 0.0)  # (N, D)
+    best_idx = jnp.argmax(intensity, axis=1)  # (N,) index into D
+    best_intensity = jnp.take_along_axis(intensity, best_idx[:, None], axis=1).squeeze(1)
+    best_ddx = jnp.take_along_axis(ddx, best_idx[:, None], axis=1).squeeze(1)
+    best_ddy = jnp.take_along_axis(ddy, best_idx[:, None], axis=1).squeeze(1)
+    safe_ddist = jnp.take_along_axis(ddist, best_idx[:, None], axis=1).squeeze(1)
+    safe_ddist = jnp.maximum(safe_ddist, 1e-6)
+    has_death = best_intensity > 0
+    inputs = inputs.at[:, 36].set(best_intensity)
+    inputs = inputs.at[:, 37].set(jnp.where(has_death, best_ddx / (safe_ddist * gs), 0.0))
+    inputs = inputs.at[:, 38].set(jnp.where(has_death, best_ddy / (safe_ddist * gs), 0.0))
 
     return inputs
 
@@ -558,6 +610,28 @@ def step(
         zone_damage=new_zone_damage,
         alive=new_alive,
         zone_deaths=state.zone_deaths + jnp.sum(zone_killed),
+    )
+
+    # Record zone deaths to echo ring buffer (parallel scatter via cumsum)
+    # First expire echoes older than ECHO_DURATION
+    expired = state.death_valid & ((tick - state.death_tick) > ECHO_DURATION)
+    new_death_valid = state.death_valid & ~expired
+
+    kill_count = jnp.sum(zone_killed.astype(jnp.int32))
+    local_idx = jnp.cumsum(zone_killed.astype(jnp.int32)) - 1  # (N,), 0-based for killed prey
+    D = state.death_x.shape[0]
+    write_pos = (state.death_cursor + local_idx) % D
+    new_death_x = state.death_x.at[write_pos].set(jnp.where(zone_killed, state.prey_x, state.death_x[write_pos]))
+    new_death_y = state.death_y.at[write_pos].set(jnp.where(zone_killed, state.prey_y, state.death_y[write_pos]))
+    new_death_tick = state.death_tick.at[write_pos].set(jnp.where(zone_killed, tick, state.death_tick[write_pos]))
+    new_death_valid_with_new = new_death_valid.at[write_pos].set(jnp.where(zone_killed, True, new_death_valid[write_pos]))
+
+    state = state._replace(
+        death_x=new_death_x,
+        death_y=new_death_y,
+        death_tick=new_death_tick,
+        death_valid=new_death_valid_with_new,
+        death_cursor=(state.death_cursor + kill_count) % D,
     )
 
     # -- Metrics: per-tick and zone stats --

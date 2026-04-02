@@ -54,23 +54,24 @@ TRAJ_COLUMNS = (
 FLUCT_WINDOW = 10
 
 
-def _buffer_sizes(pop_size: int, ticks: int = 500) -> tuple[int, int]:
-    """Compute signal and event buffer sizes based on actual capacity needs.
+def _buffer_sizes(pop_size: int, ticks: int = 500) -> tuple[int, int, int]:
+    """Compute signal, event, and death buffer sizes.
 
     Signal ring buffer: holds active signals (max lifetime = signal_ticks=4).
     Worst case = pop * 4 if every prey emits every tick. Use pop * 6 for headroom.
-    Event ring buffer: for input MI statistics. Needs enough samples for
-    statistical validity, not every emission. pop * 20 is generous.
+    Event ring buffer: for input MI statistics. pop * 20 is generous.
+    Death ring buffer: worst case all prey die in one generation.
     """
     max_signals = max(50_000, pop_size * 6)
     max_events = max(100_000, pop_size * 20)
-    return max_signals, max_events
+    max_deaths = max(1_000, pop_size)
+    return max_signals, max_events, max_deaths
 
 
-# input_mi.csv: 37 columns
+# input_mi.csv: 40 columns (1 + 39 input dims)
 INPUT_MI_COLUMNS = ["generation"] + [
     f"mi_{name}" for name in [
-        "zone_damage", "energy_delta", "dead_spare",
+        "zone_damage", "energy_delta", "freeze_pressure",
         "food_dx", "food_dy", "food_dist",
         "ally_dx", "ally_dy", "ally_dist",
         "sig0_str", "sig0_dx", "sig0_dy",
@@ -81,6 +82,7 @@ INPUT_MI_COLUMNS = ["generation"] + [
         "sig5_str", "sig5_dx", "sig5_dy",
         "mem0", "mem1", "mem2", "mem3", "mem4", "mem5", "mem6", "mem7",
         "energy",
+        "death_nearby", "death_dx", "death_dy",
     ]
 ]
 
@@ -95,7 +97,7 @@ def run_seed(
     key = jax.random.key(seed)
 
     N = params.pop_size
-    max_signals, max_events = _buffer_sizes(N)
+    max_signals, max_events, max_deaths = _buffer_sizes(N)
     k1, k2, k3, key = jax.random.split(key, 4)
 
     # Initialize population
@@ -142,7 +144,7 @@ def run_seed(
         )
         print(
             f"Backend: {jax.default_backend()} | "
-            f"Buffers: signals={max_signals} events={max_events}"
+            f"Buffers: signals={max_signals} events={max_events} deaths={max_deaths}"
         )
 
         for gen in range(generations):
@@ -165,6 +167,7 @@ def run_seed(
                 max_signals=max_signals,
                 ticks_per_eval=params.ticks_per_eval,
                 max_events=max_events,
+                max_deaths=max_deaths,
                 key=k_eval,
             )
 

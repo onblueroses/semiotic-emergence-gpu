@@ -33,6 +33,10 @@ class SimParams:
     metrics_interval: int = 1
     fast_fail_tick: int = 0
     signal_ticks: int = 4
+    freeze_zones: int = 0
+    poison_ratio: float = 0.0
+    checkpoint_interval: int = 0
+    resume: str | None = None
 
     @staticmethod
     def from_cli(argv: list[str] | None = None) -> SimParams:
@@ -56,6 +60,10 @@ class SimParams:
         p.add_argument("--fast-fail", type=int, default=0)
         p.add_argument("--zone-coverage", type=float, default=None)
         p.add_argument("--no-signals", action="store_true")
+        p.add_argument("--freeze-zones", type=int, default=0)
+        p.add_argument("--poison-ratio", type=float, default=0.0)
+        p.add_argument("--checkpoint-interval", type=int, default=0)
+        p.add_argument("--resume", type=str, default=None)
         args = p.parse_args(argv)
 
         scale = args.grid / 20.0
@@ -93,4 +101,8 @@ class SimParams:
             metrics_interval=max(args.metrics_interval, 1),
             fast_fail_tick=args.fast_fail,
             signal_ticks=args.signal_ticks,
+            freeze_zones=args.freeze_zones,
+            poison_ratio=args.poison_ratio,
+            checkpoint_interval=args.checkpoint_interval,
+            resume=args.resume,
         )
