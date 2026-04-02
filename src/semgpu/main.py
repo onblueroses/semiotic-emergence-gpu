@@ -384,6 +384,7 @@ def run_seed(
                     fzd, f"{food_mi:.6f}", pe, f"{energy_delta_mi:.6f}",
                 ]
                 writer.writerow(row)
+                f.flush()
 
                 # Write trajectory.csv row
                 n_pairs = 6 * 5 // 2  # 15
