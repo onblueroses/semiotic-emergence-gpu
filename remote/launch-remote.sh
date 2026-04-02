@@ -33,7 +33,7 @@ mkdir -p /workspace/results/7k-seed42
 # Write the run-and-teardown wrapper with creds baked in
 cat > /workspace/run-teardown.sh << EOF
 #!/usr/bin/env bash
-set -euo pipefail
+# No set -e: teardown must run even if Python crashes or exits non-zero.
 echo "Started: \$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /workspace/run.log 2>&1
 
 cd /workspace/results/7k-seed42
@@ -44,7 +44,6 @@ python3 -m semgpu.main 42 100000 \\
   --pred 5 --freeze-zones 2 --poison-ratio 0.0 \\
   --metrics-interval 10 --checkpoint-interval 1000 \\
   >> /workspace/run.log 2>&1
-
 EXIT=\$?
 echo "Python exited \$EXIT at \$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /workspace/run.log
 

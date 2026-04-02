@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local cron-based monitor for the 7k run on Vast.ai instance 34012258.
+# Local cron-based monitor for the 7k run on Vast.ai instance 34012705.
 # Runs every 10 minutes via cron. Copies results and destroys instance on completion.
 #
 # Install: crontab -e
@@ -59,7 +59,7 @@ if [ -f "$DONE_MARKER" ]; then
     echo "  Monitor complete - cron entry removed."
 else
     # Periodic progress sync
-    vastai copy "C.${INSTANCE_ID}:/workspace/results/7k-seed42/results.csv" \
+    vastai copy "C.${INSTANCE_ID}:/workspace/results/7k-seed42/output.csv" \
       "$LOCAL_RESULTS/results-partial.csv" 2>/dev/null \
       && echo "  Progress CSV synced." \
       || echo "  No CSV yet."

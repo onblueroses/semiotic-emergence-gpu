@@ -21,7 +21,7 @@ vastai copy "C.${INSTANCE_ID}:/workspace/run.log" /tmp/semgpu-run.log 2>/dev/nul
 
 echo ""
 echo "=== CSV progress ==="
-vastai copy "C.${INSTANCE_ID}:/workspace/results/7k-seed42/results.csv" /tmp/semgpu-results.csv 2>/dev/null \
+vastai copy "C.${INSTANCE_ID}:/workspace/results/7k-seed42/output.csv" /tmp/semgpu-results.csv 2>/dev/null \
   && echo "  Lines: $(wc -l < /tmp/semgpu-results.csv) (header + generations)" \
   && tail -3 /tmp/semgpu-results.csv \
   || echo "  (CSV not available yet)"
