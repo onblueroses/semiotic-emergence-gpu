@@ -1,10 +1,11 @@
 """Integration tests - full generation evaluation."""
 
+
 import jax
 import jax.numpy as jnp
 
 from semgpu.brain import DEFAULT_BASE_HIDDEN, DEFAULT_SIGNAL_HIDDEN, MAX_GENOME_LEN
-from semgpu.world import init_world, evaluate_generation
+from semgpu.world import evaluate_generation, init_world
 
 
 def test_evaluate_generation_runs():
@@ -141,3 +142,65 @@ def test_no_signals_mode():
     )
 
     assert int(result.total_signals) == 0
+
+
+# ---- Checkpoint roundtrip tests ----
+
+def test_checkpoint_roundtrip():
+    """Save a checkpoint at gen 3 and load it back, verify arrays identical."""
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    from semgpu.config import SimParams  # noqa: PLC0415
+    from semgpu.main import load_checkpoint, save_checkpoint  # noqa: PLC0415
+
+    key = jax.random.key(55)
+    k1, k2, k3 = jax.random.split(key, 3)
+    n = 10
+
+    weights = jax.random.normal(k1, (n, MAX_GENOME_LEN)) * 0.5
+    base_hidden = jnp.full(n, DEFAULT_BASE_HIDDEN, dtype=jnp.int32)
+    signal_hidden = jnp.full(n, DEFAULT_BASE_HIDDEN, dtype=jnp.int32)
+    prey_x = jax.random.randint(k2, (n,), 0, 20)
+    prey_y = jax.random.randint(k3, (n,), 0, 20)
+    params = SimParams()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        npz_path = save_checkpoint(
+            tmpdir, 3, weights, base_hidden, signal_hidden, prey_x, prey_y, params, key,
+        )
+        assert os.path.exists(npz_path)
+        json_path = npz_path.replace(".npz", ".json")
+        assert os.path.exists(json_path)
+
+        gen, arrays, params_dict = load_checkpoint(npz_path)
+        assert gen == 3
+        assert np.allclose(arrays["weights"], np.asarray(weights))
+        assert np.allclose(arrays["base_hidden"], np.asarray(base_hidden))
+        assert np.allclose(arrays["prey_x"], np.asarray(prey_x))
+        assert params_dict["pop_size"] == 384
+
+
+def test_checkpoint_smoke_creates_files():
+    """Run 5 gens with --checkpoint-interval 2, verify checkpoint files exist."""
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from semgpu.config import SimParams  # noqa: PLC0415
+    from semgpu.main import run_seed  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orig_dir = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            params = SimParams.from_cli(["0", "5", "--pop", "20", "--grid", "10",
+                                         "--pred", "1", "--ticks", "10",
+                                         "--checkpoint-interval", "2"])
+            run_seed(42, 5, params)
+            # Checkpoints at gen 1 (0-indexed: after gen 1, so gen=1) and gen 3
+            ckpt_files = [f for f in os.listdir("checkpoints") if f.endswith(".npz")]
+            assert len(ckpt_files) >= 1
+        finally:
+            os.chdir(orig_dir)

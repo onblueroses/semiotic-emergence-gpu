@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
+import json
+import os
 import sys
 import time
 
@@ -29,6 +32,49 @@ from semgpu.metrics import (
     trajectory_jsd,
 )
 from semgpu.world import evaluate_generation, init_world
+
+
+def save_checkpoint(run_dir: str, gen: int, weights, base_hidden, signal_hidden,
+                    prey_x, prey_y, params: SimParams, key) -> str:
+    """Save evolution state to {run_dir}/checkpoint_gen{gen}.npz + .json sidecar.
+
+    Returns the npz path.
+    """
+    os.makedirs(run_dir, exist_ok=True)
+    npz_path = os.path.join(run_dir, f"checkpoint_gen{gen}.npz")
+    json_path = os.path.join(run_dir, f"checkpoint_gen{gen}.json")
+
+    np.savez(
+        npz_path,
+        weights=np.asarray(weights),
+        base_hidden=np.asarray(base_hidden),
+        signal_hidden=np.asarray(signal_hidden),
+        prey_x=np.asarray(prey_x),
+        prey_y=np.asarray(prey_y),
+        rng_key=np.asarray(jax.random.key_data(key)),
+    )
+
+    meta = {
+        "generation": gen,
+        "params": dataclasses.asdict(params),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with open(json_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return npz_path
+
+
+def load_checkpoint(npz_path: str) -> tuple[int, dict, dict]:
+    """Load checkpoint. Returns (generation, arrays_dict, params_dict)."""
+    json_path = npz_path.replace(".npz", ".json")
+    data = np.load(npz_path)
+    arrays = {k: data[k] for k in data.files}
+
+    with open(json_path) as f:
+        meta = json.load(f)
+
+    return meta["generation"], arrays, meta.get("params", {})
 
 # CSV column headers matching Rust output.csv (27 columns)
 OUTPUT_COLUMNS = [
@@ -95,20 +141,32 @@ def run_seed(
 
     Returns dict with final_matrix (6x4 int), avg_fitness, max_fitness, mutual_info.
     """
-    key = jax.random.key(seed)
-
     N = params.pop_size
     max_signals, max_events, max_deaths = _buffer_sizes(N)
-    k1, k2, k3, key = jax.random.split(key, 4)
 
-    # Initialize population
-    prey_x = jax.random.randint(k1, (N,), 0, params.grid_size)
-    prey_y = jax.random.randint(k2, (N,), 0, params.grid_size)
-    weights = jax.random.uniform(k3, (N, MAX_GENOME_LEN), minval=-1.0, maxval=1.0)
-    base_hidden = jnp.full(N, DEFAULT_BASE_HIDDEN, dtype=jnp.int32)
-    signal_hidden = jnp.full(N, DEFAULT_SIGNAL_HIDDEN, dtype=jnp.int32)
+    # Initialize population (or resume from checkpoint)
+    start_gen = 0
     parent_indices = jnp.full((N, 2), -1, dtype=jnp.int32)
     grandparent_indices = jnp.full((N, 4), -1, dtype=jnp.int32)
+
+    if params.resume:
+        start_gen, arrays, _ = load_checkpoint(params.resume)
+        start_gen += 1  # resume from next generation
+        weights = jnp.array(arrays["weights"])
+        base_hidden = jnp.array(arrays["base_hidden"])
+        signal_hidden = jnp.array(arrays["signal_hidden"])
+        prey_x = jnp.array(arrays["prey_x"])
+        prey_y = jnp.array(arrays["prey_y"])
+        key = jax.random.key(seed)  # re-derive key from seed (deterministic given seed)
+        print(f"Resuming from gen {start_gen} (loaded: {params.resume})")
+    else:
+        key = jax.random.key(seed)
+        k1, k2, k3, key = jax.random.split(key, 4)
+        prey_x = jax.random.randint(k1, (N,), 0, params.grid_size)
+        prey_y = jax.random.randint(k2, (N,), 0, params.grid_size)
+        weights = jax.random.uniform(k3, (N, MAX_GENOME_LEN), minval=-1.0, maxval=1.0)
+        base_hidden = jnp.full(N, DEFAULT_BASE_HIDDEN, dtype=jnp.int32)
+        signal_hidden = jnp.full(N, DEFAULT_SIGNAL_HIDDEN, dtype=jnp.int32)
 
     # MI bin edges: [zone_radius, signal_range, signal_range * 1.375]
     mi_bins = (params.zone_radius, params.signal_range, params.signal_range * 1.375)
@@ -123,17 +181,19 @@ def run_seed(
     last_max_fit = 0.0
     last_mutual_info = 0.0
 
+    csv_mode = "a" if params.resume else "w"
     with (
-        open("output.csv", "w", newline="") as f,
-        open("trajectory.csv", "w", newline="") as tf,
-        open("input_mi.csv", "w", newline="") as imf,
+        open("output.csv", csv_mode, newline="") as f,
+        open("trajectory.csv", csv_mode, newline="") as tf,
+        open("input_mi.csv", csv_mode, newline="") as imf,
     ):
         writer = csv.writer(f)
-        writer.writerow(OUTPUT_COLUMNS)
         traj_writer = csv.writer(tf)
-        traj_writer.writerow(TRAJ_COLUMNS)
         imi_writer = csv.writer(imf)
-        imi_writer.writerow(INPUT_MI_COLUMNS)
+        if not params.resume:
+            writer.writerow(OUTPUT_COLUMNS)
+            traj_writer.writerow(TRAJ_COLUMNS)
+            imi_writer.writerow(INPUT_MI_COLUMNS)
 
         print(
             f"Config: pop={params.pop_size} grid={params.grid_size} "
@@ -148,7 +208,7 @@ def run_seed(
             f"Buffers: signals={max_signals} events={max_events} deaths={max_deaths}"
         )
 
-        for gen in range(generations):
+        for gen in range(start_gen, generations):
             gen_start = time.time()
             k_eval, k_evo, key = jax.random.split(key, 3)
 
@@ -377,6 +437,14 @@ def run_seed(
                 fallback_radius=params.fallback_radius,
                 key=k_evo,
             )
+
+            # Save checkpoint if requested
+            if params.checkpoint_interval > 0 and (gen + 1) % params.checkpoint_interval == 0:
+                ckpt_path = save_checkpoint(
+                    "checkpoints", gen, weights, base_hidden, signal_hidden,
+                    prey_x, prey_y, params, key,
+                )
+                print(f"  Checkpoint saved: {ckpt_path}")
 
     print(f"Done. {generations} generations written to output.csv + trajectory.csv + input_mi.csv")
 
