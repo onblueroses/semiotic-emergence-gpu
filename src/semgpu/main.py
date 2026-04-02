@@ -303,7 +303,7 @@ def run_seed(
                 spt = np.asarray(fs.per_tick_signals)
                 apt = np.asarray(fs.per_tick_alive)
                 mzd = np.asarray(fs.per_tick_min_zdist)
-                norm_sig_rate = np.where(apt > 0, spt / apt, 0.0)
+                norm_sig_rate = np.where(apt > 0, spt / np.maximum(apt, 1), 0.0)
                 silence_corr = pearson(norm_sig_rate, mzd)
 
                 # Sender fit correlation
