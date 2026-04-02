@@ -28,11 +28,14 @@ from semgpu.spatial import (
     nearest_in_grid,
     nearest_zone_edge_dist,
     wrap_delta,
-    zone_drain_amount,
 )
 
 # Death echo duration: number of ticks a zone death remains visible (matches Rust ECHO_DURATION=30)
 ECHO_DURATION = 30
+
+# Freeze zone drain multipliers (matches Rust world.rs)
+FREEZE_MOVE_PENALTY = 3.0   # moving in freeze zone: drain * 3.0
+FREEZE_STILL_FACTOR = 0.1   # staying still in freeze zone: drain * 0.1
 
 # Input layout offsets (must match Rust)
 SIGNAL_INPUT_START = 9
@@ -77,11 +80,13 @@ class WorldState(NamedTuple):
     zone_y: jnp.ndarray          # (Z,) float32
     zone_radius: jnp.ndarray     # (Z,) float32
     zone_speed: jnp.ndarray      # (Z,) float32
+    zone_type: jnp.ndarray       # (Z,) bool - False=flee, True=freeze
 
     # Food (F = max food slots)
     food_x: jnp.ndarray          # (F,) int32
     food_y: jnp.ndarray          # (F,) int32
     food_is_patch: jnp.ndarray   # (F,) bool
+    food_is_poison: jnp.ndarray  # (F,) bool - poison gives -0.3 energy
     food_alive: jnp.ndarray      # (F,) bool
     food_count: jnp.ndarray      # scalar int32, current number of alive food
 
@@ -104,6 +109,9 @@ class WorldState(NamedTuple):
     tick: jnp.ndarray             # scalar int32
     signals_emitted: jnp.ndarray  # scalar int32
     zone_deaths: jnp.ndarray      # scalar int32
+    freeze_zone_deaths: jnp.ndarray  # scalar int32
+    poison_eaten: jnp.ndarray     # scalar int32
+    good_food_eaten: jnp.ndarray  # scalar int32 - only good food contributes to fitness
 
     # RNG
     key: jnp.ndarray              # PRNGKey
@@ -148,6 +156,8 @@ def init_world(
     max_events: int,
     max_deaths: int,
     key: jnp.ndarray,
+    num_freeze: int = 0,
+    poison_ratio: float = 0.0,
 ) -> WorldState:
     """Initialize a WorldState for one generation evaluation."""
     N = prey_x.shape[0]
@@ -156,15 +166,22 @@ def init_world(
     # Zone positions (continuous float)
     zx = jax.random.uniform(k1, (num_zones,)) * grid_size
     zy = jax.random.uniform(k2, (num_zones,)) * grid_size
+    # Zone types: first (num_zones - num_freeze) are flee, last num_freeze are freeze
+    num_flee = num_zones - num_freeze
+    zt = jnp.concatenate([
+        jnp.zeros(num_flee, dtype=jnp.bool_),
+        jnp.ones(num_freeze, dtype=jnp.bool_),
+    ]) if num_zones > 0 else jnp.zeros(0, dtype=jnp.bool_)
 
     # Food positions
     fx = jax.random.randint(k3, (food_count,), 0, grid_size)
     fy = jax.random.randint(k4, (food_count,), 0, grid_size)
-    k5, k6 = jax.random.split(k4)
+    k5, k6, k7 = jax.random.split(k4, 3)
     fp = jax.random.uniform(k5, (food_count,)) < patch_ratio
+    fpoison = jax.random.uniform(k6, (food_count,)) < poison_ratio
 
     # Memory init: small random [-0.1, 0.1]
-    mem = jax.random.uniform(k6, (N, MEMORY_SIZE), minval=-0.1, maxval=0.1)
+    mem = jax.random.uniform(k7, (N, MEMORY_SIZE), minval=-0.1, maxval=0.1)
 
     return WorldState(
         prey_x=prey_x,
@@ -183,9 +200,11 @@ def init_world(
         zone_y=zy,
         zone_radius=jnp.full(num_zones, zone_radius),
         zone_speed=jnp.full(num_zones, zone_speed),
+        zone_type=zt,
         food_x=fx,
         food_y=fy,
         food_is_patch=fp,
+        food_is_poison=fpoison,
         food_alive=jnp.ones(food_count, dtype=jnp.bool_),
         food_count=jnp.int32(food_count),
         sig_x=jnp.zeros(max_signals, dtype=jnp.int32),
@@ -202,6 +221,9 @@ def init_world(
         tick=jnp.int32(0),
         signals_emitted=jnp.int32(0),
         zone_deaths=jnp.int32(0),
+        freeze_zone_deaths=jnp.int32(0),
+        poison_eaten=jnp.int32(0),
+        good_food_eaten=jnp.int32(0),
         key=key,
         # Metrics accumulators
         mi_counts=jnp.zeros((NUM_SYMBOLS, 4), dtype=jnp.int32),
@@ -250,7 +272,18 @@ def build_inputs(
     # 1: energy_delta
     inputs = inputs.at[:, 1].set(state.energy - state.prev_energy)
 
-    # 2: freeze_pressure - wired in Phase 2 (freeze zones); placeholder 0.0 until then
+    # 2: freeze_pressure - gradient depth in nearest freeze zone (0.0 outside all freeze zones)
+    freeze_mask = state.zone_type  # (Z,) bool - True for freeze zones
+    # Per prey: max(0, 1 - dist/radius) for each freeze zone, then take max across zones
+    prey_x_f = state.prey_x[:, None].astype(jnp.float32)  # (N, 1)
+    prey_y_f = state.prey_y[:, None].astype(jnp.float32)  # (N, 1)
+    zdx_f = (state.zone_x[None, :] - prey_x_f)  # (N, Z) approx (no wrap for float zones)
+    zdy_f = (state.zone_y[None, :] - prey_y_f)
+    zdist_f = jnp.sqrt(zdx_f * zdx_f + zdy_f * zdy_f)
+    gradient = jnp.maximum(0.0, 1.0 - zdist_f / state.zone_radius[None, :])  # (N, Z)
+    freeze_gradient = jnp.where(freeze_mask[None, :], gradient, 0.0)  # (N, Z), 0 for flee
+    freeze_pressure = jnp.max(freeze_gradient, axis=1)  # (N,) max across freeze zones
+    inputs = inputs.at[:, 2].set(freeze_pressure)
 
     # 3-5: nearest food (dx, dy, distance)
     alive_food_x = jnp.where(state.food_alive, state.food_x, -grid_size * 10)
@@ -355,6 +388,7 @@ def step(
     mi_bin2: float,
     zone_radius_scalar: float,
     max_events: int,
+    poison_ratio: float = 0.0,
 ) -> WorldState:
     """Execute one tick. All jittable."""
     key, k1, k2, k3, k4 = jax.random.split(state.key, 5)
@@ -496,11 +530,15 @@ def step(
     )
     won_food = can_eat & (priority == food_best_priority[clipped_target])
 
-    # Apply eating
-    new_energy = jnp.where(won_food, jnp.minimum(state.energy + 0.3, 1.0), state.energy)
+    # Apply eating: good food +0.3, poison food -0.3 (floored at 0)
+    ate_poison = won_food & state.food_is_poison[clipped_target]
+    ate_good = won_food & ~ate_poison
+    energy_after_eat = jnp.where(
+        ate_good, jnp.minimum(state.energy + 0.3, 1.0),
+        jnp.where(ate_poison, jnp.maximum(state.energy - 0.3, 0.0), state.energy),
+    )
     new_food_eaten = state.food_eaten + won_food.astype(jnp.int32)
-    # Mark eaten food via boolean scatter (clipped_target defaults to 0 for non-eaters,
-    # so use won_food mask to avoid corrupting food 0)
+    # Mark eaten food via boolean scatter
     eaten_mask = jnp.zeros(F, dtype=jnp.bool_)
     eaten_mask = eaten_mask.at[clipped_target].set(
         eaten_mask[clipped_target] | won_food
@@ -508,9 +546,11 @@ def step(
     new_food_alive = state.food_alive & ~eaten_mask
 
     state = state._replace(
-        energy=new_energy,
+        energy=energy_after_eat,
         food_eaten=new_food_eaten,
         food_alive=new_food_alive,
+        poison_eaten=state.poison_eaten + jnp.sum(ate_poison),
+        good_food_eaten=state.good_food_eaten + jnp.sum(ate_good),
     )
 
     # Signal emission
@@ -597,19 +637,41 @@ def step(
     new_zx, new_zy = move_zones(state.zone_x, state.zone_y, state.zone_speed, grid_size, k2)
     state = state._replace(zone_x=new_zx, zone_y=new_zy)
 
-    # Zone drain
-    drain = zone_drain_amount(
-        state.prey_x, state.prey_y,
-        state.zone_x, state.zone_y, state.zone_radius,
-        grid_size, zone_drain_rate,
-    )
+    # Zone drain (type-aware: flee zones use standard drain, freeze zones use movement multiplier)
+    # Per-zone gradient for each prey: (N, Z)
+    prey_xf = state.prey_x[:, None].astype(jnp.float32)
+    prey_yf = state.prey_y[:, None].astype(jnp.float32)
+    zone_dx = prey_xf - state.zone_x[None, :]
+    zone_dy = prey_yf - state.zone_y[None, :]
+    zone_dist = jnp.sqrt(zone_dx * zone_dx + zone_dy * zone_dy)
+    per_zone_gradient = jnp.maximum(0.0, 1.0 - zone_dist / state.zone_radius[None, :])  # (N, Z)
+
+    # Freeze-zone multiplier depends on whether prey moved this tick (action != 4)
+    is_moving = (action != 4)  # (N,) - True for movement actions, False for eat
+    freeze_factor = jnp.where(
+        is_moving[:, None],
+        FREEZE_MOVE_PENALTY,
+        FREEZE_STILL_FACTOR,
+    )  # (N, Z) broadcast but we only apply to freeze zones
+    type_multiplier = jnp.where(state.zone_type[None, :], freeze_factor, 1.0)  # (N, Z)
+
+    per_zone_drain = per_zone_gradient * type_multiplier * zone_drain_rate  # (N, Z)
+    drain = jnp.sum(per_zone_drain, axis=1)  # (N,) total drain across all zones
+
     new_zone_damage = state.zone_damage + jnp.where(alive, drain, 0.0)
     zone_killed = alive & (new_zone_damage >= 1.0)
+    # Track which zone type caused each kill (for freeze_zone_deaths counter)
+    # A prey "died in a freeze zone" if any freeze zone contributed drain to them
+    any_freeze_drain = jnp.sum(
+        jnp.where(state.zone_type[None, :], per_zone_drain, 0.0), axis=1
+    ) > 0.0
+    freeze_zone_killed = zone_killed & any_freeze_drain
     new_alive = state.alive & ~zone_killed
     state = state._replace(
         zone_damage=new_zone_damage,
         alive=new_alive,
         zone_deaths=state.zone_deaths + jnp.sum(zone_killed),
+        freeze_zone_deaths=state.freeze_zone_deaths + jnp.sum(freeze_zone_killed),
     )
 
     # Record zone deaths to echo ring buffer (parallel scatter via cumsum)
@@ -659,19 +721,22 @@ def step(
     new_food_alive_arr = state.food_alive
 
     # Only refill when below threshold
-    k3a, k3b, k3c = jax.random.split(k3, 3)
+    k3a, k3b, k3c, k3d = jax.random.split(k3, 4)
     refill_x = jax.random.randint(k3a, state.food_x.shape, 0, grid_size)
     refill_y = jax.random.randint(k3b, state.food_y.shape, 0, grid_size)
     refill_patch = jax.random.uniform(k3c, state.food_x.shape) < patch_ratio
+    refill_poison = jax.random.uniform(k3d, state.food_x.shape) < poison_ratio
 
     new_food_x = jnp.where(need_refill & ~state.food_alive, refill_x, state.food_x)
     new_food_y = jnp.where(need_refill & ~state.food_alive, refill_y, state.food_y)
     new_food_patch = jnp.where(need_refill & ~state.food_alive, refill_patch, state.food_is_patch)
+    new_food_poison = jnp.where(need_refill & ~state.food_alive, refill_poison, state.food_is_poison)
     new_food_alive_arr = jnp.where(need_refill, jnp.ones_like(state.food_alive), state.food_alive)
 
     state = state._replace(
         food_x=new_food_x, food_y=new_food_y,
-        food_is_patch=new_food_patch, food_alive=new_food_alive_arr,
+        food_is_patch=new_food_patch, food_is_poison=new_food_poison,
+        food_alive=new_food_alive_arr,
     )
 
     return state
@@ -691,7 +756,7 @@ class EvalResult(NamedTuple):
     'grid_size', 'signal_range', 'base_drain', 'signal_cost',
     'zone_drain_rate', 'patch_ratio', 'food_count', 'signal_ticks',
     'no_signals', 'max_signals', 'ticks_per_eval', 'mi_bins',
-    'zone_radius_scalar', 'max_events',
+    'zone_radius_scalar', 'max_events', 'poison_ratio',
 ])
 def evaluate_generation(
     state: WorldState,
@@ -709,6 +774,7 @@ def evaluate_generation(
     mi_bins: tuple[float, float, float] = (8.0, 8.0, 11.0),
     zone_radius_scalar: float = 8.0,
     max_events: int = 100_000,
+    poison_ratio: float = 0.0,
 ) -> EvalResult:
     """Run one generation: ticks_per_eval ticks via lax.fori_loop.
 
@@ -732,19 +798,20 @@ def evaluate_generation(
             mi_bin2=mi_bins[2],
             zone_radius_scalar=zone_radius_scalar,
             max_events=max_events,
+            poison_ratio=poison_ratio,
         )
 
     final = jax.lax.fori_loop(0, ticks_per_eval, body_fn, state)
 
-    # Fitness: ticks_alive * (1 + food_eaten * 0.1) - matches Rust
+    # Fitness: ticks_alive * (1 + good_food_eaten * 0.1) - only non-poison food counts
     fitness = final.ticks_alive.astype(jnp.float32) * (
-        1.0 + final.food_eaten.astype(jnp.float32) * 0.1
+        1.0 + final.good_food_eaten.astype(jnp.float32) * 0.1
     )
 
     return EvalResult(
         fitness=fitness,
         ticks_alive=final.ticks_alive,
-        food_eaten=final.food_eaten,
+        food_eaten=final.good_food_eaten,
         total_signals=final.signals_emitted,
         zone_deaths=final.zone_deaths,
         final_state=final,

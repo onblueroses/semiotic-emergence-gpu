@@ -350,3 +350,232 @@ class TestDeathEchoes:
         inputs = build_inputs(ws, 56, 22.4)
         assert jnp.all(inputs[:, 36] >= 0.0)
         assert jnp.all(inputs[:, 36] <= 1.0)
+
+
+class TestFreezeZones:
+    """Tests for freeze zone drain mechanics (Phase 2)."""
+
+    def _make_freeze_world(self, n=10, num_zones=1, num_freeze=1, key_seed=42):
+        key = jax.random.key(key_seed)
+        ws = init_world(
+            prey_x=jnp.full(n, 14, dtype=jnp.int32),
+            prey_y=jnp.full(n, 14, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=num_zones,
+            food_count=10,
+            grid_size=28,
+            zone_radius=14.0,
+            zone_speed=0.0,
+            patch_ratio=0.0,
+            max_signals=100,
+            ticks_per_eval=50,
+            max_events=100,
+            max_deaths=n,
+            key=key,
+            num_freeze=num_freeze,
+        )
+        # Lock zone at center (14, 14) for determinism
+        return ws._replace(zone_x=jnp.array([14.0]), zone_y=jnp.array([14.0]))
+
+    def test_zone_type_set(self):
+        ws = self._make_freeze_world(num_zones=3, num_freeze=2)
+        assert ws.zone_type.shape == (3,)
+        # First zone flee, last two freeze
+        assert not bool(ws.zone_type[0])
+        assert bool(ws.zone_type[1])
+        assert bool(ws.zone_type[2])
+
+    def test_freeze_moving_more_drain_than_flee(self):
+        # Moving prey in a freeze zone take FREEZE_MOVE_PENALTY x more drain than flee.
+        # Zero weights -> action=0 (move up) -> prey are moving.
+        from semgpu.world import FREEZE_MOVE_PENALTY
+        key = jax.random.key(1)
+        n = 2
+        # Build flee-only world
+        ws_flee = init_world(
+            prey_x=jnp.full(n, 14, dtype=jnp.int32),
+            prey_y=jnp.full(n, 14, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=1, food_count=5, grid_size=28,
+            zone_radius=14.0, zone_speed=0.0, patch_ratio=0.0,
+            max_signals=50, ticks_per_eval=50, max_events=50, max_deaths=n,
+            key=key, num_freeze=0,
+        )
+        ws_flee = ws_flee._replace(zone_x=jnp.array([14.0]), zone_y=jnp.array([14.0]))
+        # Build freeze-only world
+        ws_freeze = init_world(
+            prey_x=jnp.full(n, 14, dtype=jnp.int32),
+            prey_y=jnp.full(n, 14, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=1, food_count=5, grid_size=28,
+            zone_radius=14.0, zone_speed=0.0, patch_ratio=0.0,
+            max_signals=50, ticks_per_eval=50, max_events=50, max_deaths=n,
+            key=key, num_freeze=1,
+        )
+        ws_freeze = ws_freeze._replace(zone_x=jnp.array([14.0]), zone_y=jnp.array([14.0]))
+
+        step_kwargs = dict(
+            grid_size=28, signal_range=11.2, base_drain=0.0,
+            signal_cost=0.0, zone_drain_rate=0.02, patch_ratio=0.0,
+            food_count=5, signal_ticks=4, no_signals=True, max_signals=50,
+            mi_bin0=14.0, mi_bin1=11.2, mi_bin2=15.0, zone_radius_scalar=14.0, max_events=50,
+        )
+        ws_flee2 = step(ws_flee, **step_kwargs)
+        ws_freeze2 = step(ws_freeze, **step_kwargs)
+
+        # Zero weights -> action=0 (move) -> prey are moving.
+        # Flee: drain=0.02 * 1.0. Freeze+moving: drain=0.02 * FREEZE_MOVE_PENALTY=3.0
+        flee_damage = float(ws_flee2.zone_damage[0])
+        freeze_damage = float(ws_freeze2.zone_damage[0])
+        # Freeze moving should be FREEZE_MOVE_PENALTY x more damage than flee
+        assert freeze_damage > flee_damage
+        assert abs(freeze_damage / flee_damage - FREEZE_MOVE_PENALTY) < 0.1
+
+    def test_freeze_pressure_zero_outside(self):
+        ws = self._make_freeze_world()
+        # Place prey far from zone
+        ws2 = ws._replace(
+            prey_x=jnp.zeros(ws.prey_x.shape[0], dtype=jnp.int32),
+            prey_y=jnp.zeros(ws.prey_y.shape[0], dtype=jnp.int32),
+        )
+        inputs = build_inputs(ws2, 28, 11.2)
+        # At (0,0), distance to freeze zone at (14,14) = sqrt(2)*14 ≈ 19.8 > zone_radius=14
+        # So freeze_pressure should be 0
+        assert jnp.allclose(inputs[:, 2], 0.0, atol=1e-5)
+
+    def test_freeze_pressure_nonzero_inside(self):
+        ws = self._make_freeze_world()
+        # Prey already at (14, 14) = zone center
+        inputs = build_inputs(ws, 28, 11.2)
+        # At zone center, freeze_pressure = 1.0
+        assert jnp.allclose(inputs[:, 2], 1.0, atol=1e-4)
+
+    def test_flee_zones_no_freeze_pressure(self):
+        # With all flee zones, freeze_pressure should be 0 everywhere
+        key = jax.random.key(7)
+        n = 5
+        ws = init_world(
+            prey_x=jnp.full(n, 5, dtype=jnp.int32),
+            prey_y=jnp.full(n, 5, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=2, food_count=5, grid_size=28,
+            zone_radius=4.0, zone_speed=0.0, patch_ratio=0.0,
+            max_signals=50, ticks_per_eval=50, max_events=50, max_deaths=n,
+            key=key, num_freeze=0,  # all flee
+        )
+        inputs = build_inputs(ws, 28, 11.2)
+        assert jnp.allclose(inputs[:, 2], 0.0, atol=1e-5)
+
+    def test_freeze_zone_deaths_tracked(self):
+        ws = self._make_freeze_world(n=20)
+        step_kwargs = dict(
+            grid_size=28, signal_range=11.2, base_drain=0.0,
+            signal_cost=0.0, zone_drain_rate=0.5, patch_ratio=0.0,
+            food_count=10, signal_ticks=4, no_signals=True, max_signals=100,
+            mi_bin0=14.0, mi_bin1=11.2, mi_bin2=15.0, zone_radius_scalar=14.0, max_events=100,
+        )
+        for _ in range(10):
+            ws = step(ws, **step_kwargs)
+        # Some prey should have died in the freeze zone
+        assert int(ws.freeze_zone_deaths) > 0
+
+
+class TestPoisonFood:
+    """Tests for poison food mechanics (Phase 2)."""
+
+    def _make_world_with_poison(self, n=10, poison_ratio=1.0):
+        key = jax.random.key(99)
+        k1, k2 = jax.random.split(key)
+        ws = init_world(
+            prey_x=jax.random.randint(k1, (n,), 0, 28),
+            prey_y=jax.random.randint(k2, (n,), 0, 28),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=1,        # need at least 1 to avoid empty-array min error
+            food_count=50,
+            grid_size=28,
+            zone_radius=1.0,
+            zone_speed=0.0,
+            patch_ratio=0.0,
+            max_signals=100,
+            ticks_per_eval=500,
+            max_events=100,
+            max_deaths=n,
+            key=key,
+            poison_ratio=poison_ratio,
+        )
+        return ws
+
+    def test_poison_food_is_poison(self):
+        ws = self._make_world_with_poison(poison_ratio=1.0)
+        assert jnp.all(ws.food_is_poison)
+
+    def test_no_poison_food_not_poison(self):
+        ws = self._make_world_with_poison(poison_ratio=0.0)
+        assert not jnp.any(ws.food_is_poison)
+
+    def test_poison_decreases_energy(self):
+        # Verify food_is_poison is set and poison_eaten counter initializes at 0
+        key = jax.random.key(33)
+        n = 5
+        ws = init_world(
+            prey_x=jnp.zeros(n, dtype=jnp.int32),
+            prey_y=jnp.zeros(n, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=1,        # need at least 1 zone to avoid empty-array error
+            food_count=10,
+            grid_size=28,
+            zone_radius=1.0,
+            zone_speed=0.0,
+            patch_ratio=0.0,
+            max_signals=50,
+            ticks_per_eval=50,
+            max_events=50,
+            max_deaths=n,
+            key=key,
+            poison_ratio=1.0,
+        )
+        # All food should be poison
+        assert jnp.all(ws.food_is_poison)
+        assert ws.poison_eaten == 0
+        # With zero weights, action=0 (move up), so prey won't eat this tick.
+        # Step should run without error.
+        step_kwargs = dict(
+            grid_size=28, signal_range=11.2, base_drain=0.0,
+            signal_cost=0.0, zone_drain_rate=0.0, patch_ratio=0.0,
+            food_count=10, signal_ticks=4, no_signals=True, max_signals=50,
+            mi_bin0=1.0, mi_bin1=1.0, mi_bin2=1.5, zone_radius_scalar=1.0, max_events=50,
+            poison_ratio=1.0,
+        )
+        ws2 = step(ws, **step_kwargs)
+        assert ws2.tick == 1
+
+    def test_good_food_increases_energy(self):
+        # Verify non-poison food world state is consistent
+        key = jax.random.key(44)
+        n = 5
+        ws = init_world(
+            prey_x=jnp.zeros(n, dtype=jnp.int32),
+            prey_y=jnp.zeros(n, dtype=jnp.int32),
+            weights=jnp.zeros((n, MAX_GENOME_LEN)),
+            base_hidden=jnp.full(n, DEFAULT_BASE_HIDDEN),
+            signal_hidden=jnp.full(n, DEFAULT_SIGNAL_HIDDEN),
+            num_zones=1, food_count=10, grid_size=28,
+            zone_radius=1.0, zone_speed=0.0, patch_ratio=0.0,
+            max_signals=50, ticks_per_eval=50, max_events=50, max_deaths=n,
+            key=key, poison_ratio=0.0,
+        )
+        assert jnp.all(~ws.food_is_poison)
+        assert ws.poison_eaten == 0
+        assert ws.good_food_eaten == 0

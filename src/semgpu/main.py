@@ -30,7 +30,7 @@ from semgpu.metrics import (
 )
 from semgpu.world import evaluate_generation, init_world
 
-# CSV column headers matching Rust output.csv (23 columns)
+# CSV column headers matching Rust output.csv (27 columns)
 OUTPUT_COLUMNS = [
     "generation", "avg_fitness", "max_fitness", "signals_emitted",
     "iconicity", "mutual_info", "jsd_no_pred", "jsd_pred",
@@ -40,6 +40,7 @@ OUTPUT_COLUMNS = [
     "avg_base_hidden", "min_base_hidden", "max_base_hidden",
     "avg_signal_hidden", "min_signal_hidden", "max_signal_hidden",
     "zone_deaths", "signal_entropy",
+    "freeze_zone_deaths", "food_mi", "poison_eaten", "energy_delta_mi",
 ]
 
 # trajectory.csv: 47 columns
@@ -169,6 +170,8 @@ def run_seed(
                 max_events=max_events,
                 max_deaths=max_deaths,
                 key=k_eval,
+                num_freeze=params.freeze_zones,
+                poison_ratio=params.poison_ratio,
             )
 
             result = evaluate_generation(
@@ -187,6 +190,7 @@ def run_seed(
                 mi_bins=mi_bins,
                 zone_radius_scalar=params.zone_radius,
                 max_events=max_events,
+                poison_ratio=params.poison_ratio,
             )
 
             fitness = result.fitness
@@ -214,6 +218,8 @@ def run_seed(
                 max_fit = float(jnp.max(result.fitness))
                 total_sig = int(result.total_signals)
                 zd = int(result.zone_deaths)
+                fzd = int(fs.freeze_zone_deaths)
+                pe = int(fs.poison_eaten)
 
                 # Sender metrics
                 iconicity = compute_iconicity(
@@ -292,7 +298,18 @@ def run_seed(
                 min_sh = int(jnp.min(signal_hidden))
                 max_sh = int(jnp.max(signal_hidden))
 
-                # Write output.csv row
+                # Compute input MI (needed for food_mi and energy_delta_mi in output.csv)
+                evt_count = int(fs.evt_count)
+                if evt_count > 0:
+                    evt_sym_np = np.asarray(fs.evt_symbol)[:evt_count]
+                    evt_inp_np = np.asarray(fs.evt_inputs)[:evt_count]
+                    input_mi_vals = compute_input_mi(evt_sym_np, evt_inp_np)
+                else:
+                    input_mi_vals = np.zeros(39)
+                food_mi = float(input_mi_vals[5])       # I(Signal; food_dist) at dim 5
+                energy_delta_mi = float(input_mi_vals[1])  # I(Signal; energy_delta) at dim 1
+
+                # Write output.csv row (27 columns)
                 row = [
                     gen, f"{avg_fit:.4f}", f"{max_fit:.4f}", total_sig,
                     f"{iconicity:.6f}", f"{mutual_info:.6f}",
@@ -304,6 +321,7 @@ def run_seed(
                     f"{avg_bh:.1f}", min_bh, max_bh,
                     f"{avg_sh:.1f}", min_sh, max_sh,
                     zd, f"{sig_entropy:.6f}",
+                    fzd, f"{food_mi:.6f}", pe, f"{energy_delta_mi:.6f}",
                 ]
                 writer.writerow(row)
 
@@ -328,13 +346,6 @@ def run_seed(
                 traj_writer.writerow(traj_row)
 
                 # Write input_mi.csv row
-                evt_count = int(fs.evt_count)
-                if evt_count > 0:
-                    evt_sym_np = np.asarray(fs.evt_symbol)[:evt_count]
-                    evt_inp_np = np.asarray(fs.evt_inputs)[:evt_count]
-                    input_mi_vals = compute_input_mi(evt_sym_np, evt_inp_np)
-                else:
-                    input_mi_vals = np.zeros(36)
                 imi_row = [gen] + [f"{v:.6f}" for v in input_mi_vals]
                 imi_writer.writerow(imi_row)
 
